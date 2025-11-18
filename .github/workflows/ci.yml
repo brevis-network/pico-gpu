@@ -1,0 +1,61 @@
+name: test-build
+
+on:
+  workflow_dispatch:
+    branches:
+    - '**'
+  pull_request:
+    branches:
+    - main
+
+jobs:
+  cargo-test-no-run:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Get date
+      id: get-date
+      run: echo "date=$(date -u +%Y-%m)" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          **/Cargo.lock
+          **/target
+        key: ${{ runner.os }}-cargo-${{ steps.get-date.outputs.date }}
+
+    - name: Environment
+      shell: bash
+      run: |
+        lscpu 2>/dev/null && echo --- || true
+        env | sort
+
+    - name: Install cuda-minimal-build-12-8
+      shell: bash
+      run: |
+        # https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_network
+        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb
+        sudo apt-get update
+        sudo apt-get -y install cuda-minimal-build-12-8
+        [ -d /usr/local/cuda-12.8/bin ]
+
+    - name: Test-build rust crate with cuda-12.8
+      shell: bash
+      run: |
+        rustc --version --verbose
+        export PATH=$PATH:/usr/local/cuda-12.8/bin
+        ( cd rust
+          cargo update
+          cargo build --release
+        )
+
+    - name: Clean up
+      shell: bash
+      run: |
+        rm -rf ~/.cargo/registry/src
+        rm -rf ~/.cargo/registry/index/*/.cache

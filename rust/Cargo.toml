@@ -1,0 +1,24 @@
+[package]
+name = "pico-gpu"
+version = "0.1.11"
+edition = "2021"
+description = "GPU-acceleration library for Pico zkVM"
+repository = "https://github.com/brevis-network/pico-gpu"
+categories = ["cryptography"]
+keywords = ["crypto", "zero-knowledge", "cuda", "gpu"]
+links = "pico-gpu"
+include = [
+    "/Cargo.toml",
+    "/build.rs",
+    "/src/**",
+    "/pico-gpu/ff/**",
+    "/pico-gpu/util/**",
+    "/pico-gpu/chip/**",
+    "/pico-gpu/hash/**",
+    "/pico-gpu/poseidon2/**",
+]
+
+[features]
+default = ["cuda"]
+# coerse either as an alternative to auto-detection
+cuda = []
