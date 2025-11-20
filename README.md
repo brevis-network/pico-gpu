@@ -20,3 +20,7 @@ pico-gpu builds on prior work in GPU-accelerated zero-knowledge proving:
 
 - [sppark](https://github.com/supranational/sppark): Portions of this library, especially in `util/`, are ported and adapted from the `sppark` project.
 - [SP1](https://github.com/succinctlabs/sp1): The BabyBear field implementation under `ff/` is borrowed from SP1, and parts of pico-gpu’s trace-generation design are inspired by SP1.
+
+## License
+
+This project is licensed under the terms described in [LICENSE.md](LICENSE.md).
