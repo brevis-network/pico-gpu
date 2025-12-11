@@ -64,6 +64,65 @@ namespace pico_gpu {
     };
   } // namespace params_secp256k1
 
+  namespace params_secp256r1 {
+    static constexpr int NumLimbs = 32;
+    static constexpr int NumWords =
+      NumLimbs / 4; // 32 limbs = 8 u32 words, corresponding to WordsFieldElement in CPU code.
+    static constexpr int NumWitnesses = 62;
+    static constexpr int WitnessOffset = 1 << 14;
+
+    // Secp256r1 modulus (p) in little-endian u32 words.
+    static __device__ __constant__ __align__(16) const uint32_t MODULUS[NumWords] = {
+      TO_CUDA_T(0xffffffffffffffffull), // LSB
+      TO_CUDA_T(0x00000000ffffffffull), TO_CUDA_T(0x0000000000000000ull),
+      TO_CUDA_T(0xffffffff00000001ull) // MSB
+    };
+
+    // MODULUS - 2 (p-2) in little-endian u32 words.
+    // Used for modular inverse via Fermat's Little Theorem: a^(p-2) mod p.
+    static __device__ __constant__ __align__(16) const uint32_t MOD_MINUS_TWO[NumWords] = {
+      TO_CUDA_T(0xfffffffffffffffdull), // LSB
+      TO_CUDA_T(0x00000000ffffffffull), TO_CUDA_T(0x0000000000000000ull),
+      TO_CUDA_T(0xffffffff00000001ull) // MSB
+    };
+
+    // (MODULUS + 1) / 4 ((p+1)/4) in little-endian u32 words.
+    // Used for square root computations
+    static __device__ __constant__ __align__(16) const uint32_t SQRT_EXP[NumWords] = {
+      TO_CUDA_T(0x0000000000000000ull), // LSB
+      TO_CUDA_T(0x0000000040000000ull), TO_CUDA_T(0x4000000000000000ull),
+      TO_CUDA_T(0x3fffffffc0000000ull) // MSB
+    };
+
+    // Secp256r1 coefficient (a) in little-endian u32 words.
+    static __device__ __constant__ __align__(16) const uint32_t WEIERSTRASS_A[NumWords] = {
+      TO_CUDA_T(0xfffffffffffffffcull), // LSB
+      TO_CUDA_T(0x00000000ffffffffull), TO_CUDA_T(0x0000000000000000ull),
+      TO_CUDA_T(0xffffffff00000001ull) // MSB
+    };
+
+    // Secp256r1 coefficient (b) in little-endian u32 words.
+    static __device__ __constant__ __align__(16) const uint32_t WEIERSTRASS_B[NumWords] = {
+      TO_CUDA_T(0x3bce3c3e27d2604bull), // LSB
+      TO_CUDA_T(0x651d06b0cc53b0f6ull), TO_CUDA_T(0xb3ebbd55769886bcull),
+      TO_CUDA_T(0x5ac635d8aa3a93e7ull) // MSB
+    };
+
+    // Secp256r1 generator x in little-endian u32 words.
+    static __device__ __constant__ __align__(16) const uint32_t GEN_X[NumWords] = {
+      TO_CUDA_T(0xf4a13945d898c296ull), // LSB
+      TO_CUDA_T(0x77037d812deb33a0ull), TO_CUDA_T(0xf8bce6e563a440f2ull),
+      TO_CUDA_T(0x6b17d1f2e12c4247ull) // MSB
+    };
+
+    // Secp256r1 generator y in little-endian u32 words.
+    static __device__ __constant__ __align__(16) const uint32_t GEN_Y[NumWords] = {
+      TO_CUDA_T(0xcbb6406837bf51f5ull), // LSB
+      TO_CUDA_T(0x2bce33576b315eceull), TO_CUDA_T(0x8ee7eb4a7c0f9e16ull),
+      TO_CUDA_T(0x4fe342e2fe1a7f9bull) // MSB
+    };
+  } // namespace params_secp256r1
+
   namespace params_bn254 {
     static constexpr int NumLimbs = 32;
     static constexpr int NumWords =
