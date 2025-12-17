@@ -237,11 +237,11 @@ namespace pico_gpu {
     /// Executes the `BN254_FP2_MUL` precompile.
     BN254_FP2_MUL = 65835,
     /// Executes the `SECP256R1_ADD` precompile.
-    SECP256R1_ADD = 65836,
+    SECP256R1_ADD = 65840,
     /// Executes the `SECP256R1_DOUBLE` precompile.
-    SECP256R1_DOUBLE = 301,
+    SECP256R1_DOUBLE = 305,
     /// Executes the `SECP256R1_DECOMPRESS` precompile.
-    SECP256R1_DECOMPRESS = 302,
+    SECP256R1_DECOMPRESS = 306,
   };
 
   enum class Register : uint8_t {
