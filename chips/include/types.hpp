@@ -1956,6 +1956,8 @@ namespace pico_gpu {
     FieldOpCols<T, NumLimbs, NumWitness> u_div_v;
     FieldSqrtCols<T, NumLimbs, NumWitness> x;
     FieldOpCols<T, NumLimbs, NumWitness> neg_x;
+    /// Gadget to check if x is zero. This is used to ensure that when x is zero, sign must be 0.
+    IsZeroOperation<T> x_is_zero;
   };
 
   /// The preprocessed columns for the CommitPVHash instruction.
