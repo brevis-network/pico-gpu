@@ -32,6 +32,18 @@ fn main() {
         "cargo:rerun-if-changed={}",
         base_dir.join("poseidon2").to_string_lossy()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        base_dir.join("quotient").to_string_lossy()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        base_dir.join("air").to_string_lossy()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        base_dir.join("matrix").to_string_lossy()
+    );
 
     // This build.rs only exports the root path and sets up rerun conditions
 }
