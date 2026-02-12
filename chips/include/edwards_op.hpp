@@ -153,6 +153,15 @@ namespace pico_gpu::edwards_op {
 
       if (byte_trace) { byte::handle_byte_lookup_event(byte_trace, ByteOpcode::AND, x[0], 1); }
     }
+
+    // Check if x is zero by checking if all limbs sum to zero.
+    // Since all limbs are non-negative (range checked), if their sum is zero, all limbs are zero.
+    // self.x.multiplication.result already contains the sqrt as field elements after populate.
+    F x_limbs_sum = F::zero();
+    for (int i = 0; i < NumLimbs; ++i) {
+      x_limbs_sum += col.x.multiplication.result[i];
+    }
+    is_zero::populate_from_field_element(col.x_is_zero, x_limbs_sum);
   }
 
   /// Convert Edwards curve addition event to trace row.
