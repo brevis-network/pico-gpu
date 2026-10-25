@@ -11,11 +11,8 @@ include = [
     "/Cargo.toml",
     "/build.rs",
     "/src/**",
-    "/pico-gpu/ff/**",
-    "/pico-gpu/util/**",
-    "/pico-gpu/chip/**",
-    "/pico-gpu/hash/**",
-    "/pico-gpu/poseidon2/**",
+    "/pico-gpu/src/**",
+    "/pico-gpu/third_party/**",
 ]
 
 [features]

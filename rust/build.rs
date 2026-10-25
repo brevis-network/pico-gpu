@@ -1,3 +1,7 @@
+// Copyright (c) 2025-2026 Brevis. All Rights Reserved.
+// Licensed under the Business Source License 1.1 (BUSL-1.1).
+// See LICENSE.md for details.
+
 use std::{env, path::PathBuf};
 
 fn main() {
@@ -15,34 +19,19 @@ fn main() {
 
     // Set up rerun conditions for directories that contain headers
     // gpu-api/build.rs scans these directories for headers, so we need to
-    // trigger rebuilds when headers change
+    // trigger rebuilds when headers change.
+    //
+    // Only the four directories this crate still carries. A rerun-if-changed naming a
+    // path that does not exist makes cargo re-run this script on every build, so the
+    // list has to track what is actually here: quotient/, air/, matrix/ and fri_open/
+    // held the classic STARK prover and are gone.
     println!(
         "cargo:rerun-if-changed={}",
-        base_dir.join("chips").to_string_lossy()
+        base_dir.join("third_party").to_string_lossy()
     );
     println!(
         "cargo:rerun-if-changed={}",
-        base_dir.join("ff").to_string_lossy()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        base_dir.join("util").to_string_lossy()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        base_dir.join("poseidon2").to_string_lossy()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        base_dir.join("quotient").to_string_lossy()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        base_dir.join("air").to_string_lossy()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        base_dir.join("matrix").to_string_lossy()
+        base_dir.join("src").to_string_lossy()
     );
 
     // This build.rs only exports the root path and sets up rerun conditions

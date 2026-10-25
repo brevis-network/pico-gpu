@@ -66,6 +66,19 @@ dkms.conf
 Cargo.lock
 target/
 
+# CUDA test binaries (compiled from .cu, no extension on Linux)
+**/test_ntt
+**/test_ntt_debug
+**/test_dsmem
+**/test_minimal
+**/test_rank
+
+# CUDA compiled artifacts
+*.cubin
+*.ptx
+*.fatbin
+**/cache/
+
 # Other tools and config
 compile_commands.json
 .cache/
