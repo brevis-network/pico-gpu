@@ -1,6 +1,5 @@
-// Copyright (c) 2025-2026 Brevis. All Rights Reserved.
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE.md for details.
+// Copyright (c) 2025-2026 Brevis.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 // Binary format of the constraint DAG: every node is one 128-bit `Rule` holding an opcode, two
 // source operands, a destination slot and two flags.

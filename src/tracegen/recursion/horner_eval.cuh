@@ -1,6 +1,5 @@
-// Copyright (c) 2025-2026 Brevis. All Rights Reserved.
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE.md for details.
+// Copyright (c) 2025-2026 Brevis.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // HornerEvalChip GPU trace generation.
 // main: DATAPAR coefficients + the x^2/x^3/x^4 degree-splitting helpers (computed on the device).

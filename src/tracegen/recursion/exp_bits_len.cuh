@@ -1,6 +1,5 @@
-// Copyright (c) 2025-2026 Brevis. All Rights Reserved.
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE.md for details.
+// Copyright (c) 2025-2026 Brevis.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // ExpBitsLenChip GPU trace generation (KoalaBear only).
 // Each request is a fixed 32-row block. main: one thread per (padded) row recomputes the squaring

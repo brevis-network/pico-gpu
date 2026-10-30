@@ -1,6 +1,5 @@
-// Copyright (c) 2025-2026 Brevis. All Rights Reserved.
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE.md for details.
+// Copyright (c) 2025-2026 Brevis.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 // MLE-interpolate butterfly kernels: one stage does, per `2*step`-aligned pair `(u, v)` that are
 // `step` apart, `v -= u` (eval->coeff) or `v += u` (coeff->eval).
