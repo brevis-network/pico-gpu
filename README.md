@@ -1,6 +1,6 @@
 # pico-gpu
 
-[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE.md)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 **pico-gpu** holds the CUDA kernels of the [Pico zkVM](https://github.com/brevis-network/pico): GPU
 trace generation for Pico's RISC-V, precompile and recursion chips, and the GPU side of Pico's
@@ -79,11 +79,22 @@ pico-gpu builds on prior work in GPU-accelerated zero-knowledge proving:
   inspired by SP1.
 - [Plonky3](https://github.com/Plonky3/Plonky3): pico-gpu's Poseidon2 kernels use Plonky3's
   KoalaBear parameters and match its permutation bit for bit.
-- [OpenVM](https://github.com/openvm-org/openvm): Parts of pico-gpu's multilinear prover design are
-  inspired by OpenVM's stark-backend.
+- [OpenVM](https://github.com/openvm-org/openvm): Parts of pico-gpu's multilinear prover kernels are
+  adapted from OpenVM's [stark-backend](https://github.com/openvm-org/stark-backend), licensed under
+  MIT or Apache-2.0.
 
 ## License
 
-This project is licensed under the Business Source License 1.1 (BUSL-1.1). See
-[LICENSE.md](LICENSE.md) for details. The sppark-derived code keeps its Apache License 2.0; see
-[third_party/sppark/LICENSE](third_party/sppark/LICENSE).
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option, except for the code derived from third-party projects,
+which keeps its original licence:
+
+- [sppark](https://github.com/supranational/sppark) (Apache-2.0, see
+  [third_party/sppark/LICENSE](third_party/sppark/LICENSE)): `third_party/sppark/`,
+  `src/common/device_ptr.hpp`, `src/common/exception.hpp`, `src/common/exception.cuh`,
+  `src/common/rusterror.h` and `src/field/kb31_t.hpp`.
+- [RISC Zero](https://github.com/risc0/risc0) (Apache-2.0), by way of OpenVM: `src/field/fp.h` and
+  `src/field/fpext.h`.
+- [OpenVM stark-backend](https://github.com/openvm-org/stark-backend) (MIT or Apache-2.0,
+  Copyright (c) 2025 The OpenVM Authors): parts of `src/prover/`, `src/common/launcher.cuh` and
+  `src/common/utils.cuh`.

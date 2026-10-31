@@ -1,6 +1,5 @@
-// Copyright (c) 2025-2026 Brevis. All Rights Reserved.
-// Licensed under the Business Source License 1.1 (BUSL-1.1).
-// See LICENSE.md for details.
+// Copyright (c) 2025-2026 Brevis.
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Packed-event (MLE_PACKED_EVENTS=1) Ecall trace-gen kernel. Additive: reconstructs the fat
 // FfiCpuEventU64 from the packed stream (exact by the packing invariants, see

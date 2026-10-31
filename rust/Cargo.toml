@@ -3,6 +3,7 @@ name = "pico-gpu"
 version = "0.1.11"
 edition = "2021"
 description = "GPU-acceleration library for Pico zkVM"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/brevis-network/pico-gpu"
 categories = ["cryptography"]
 keywords = ["crypto", "zero-knowledge", "cuda", "gpu"]
