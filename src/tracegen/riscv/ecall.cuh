@@ -199,7 +199,7 @@ namespace pico_gpu::ecall_u64 {
     }
     if (syscall_id_byte ==
         static_cast<uint8_t>(static_cast<uint32_t>(SyscallCode::COMMIT_DEFERRED_PROOFS))) {
-      // This row's own share of the tally; `deferred_tally` turns the two into running sums.
+      // This row's own share of the tally; the tally scan turns the two into running sums.
       // The mask share is the index bitmap's weight, so an out-of-range word index adds 0,
       // matching the host trace.
       const uint32_t digest_idx = static_cast<uint32_t>(op_b_value & 0xFFFFFFFF);
@@ -233,120 +233,4 @@ namespace pico_gpu::ecall_u64 {
   };
 
   constexpr int DEFERRED_TALLY_BLOCK = 256;
-
-  /// One block walks the event rows a tile at a time, turning each row's own share (written by
-  /// `event_to_row`) into the running sum down the trace. Ecall rows are one per syscall, so one
-  /// block keeps up and needs no scratch memory.
-  template <class F>
-  __global__ void deferred_tally_scan_kernel(F* trace, const size_t num_cols, const size_t nb_rows)
-  {
-    typedef cub::BlockScan<DeferredTally<F>, DEFERRED_TALLY_BLOCK> BlockScan;
-    __shared__ typename BlockScan::TempStorage temp_storage;
-    __shared__ DeferredTally<F> carry;
-    if (threadIdx.x == 0) carry = DeferredTally<F>{F::zero(), F::zero()};
-    __syncthreads();
-
-    for (size_t base = 0; base < nb_rows; base += DEFERRED_TALLY_BLOCK) {
-      const size_t row = base + threadIdx.x;
-      EcallChipColsU64<F>* cols =
-        reinterpret_cast<EcallChipColsU64<F>*>(&trace[row * num_cols]);
-      DeferredTally<F> own{F::zero(), F::zero()};
-      if (row < nb_rows) own = DeferredTally<F>{cols->deferred_commits, cols->deferred_commit_mask};
-      DeferredTally<F> prefix;
-      DeferredTally<F> tile_total;
-      BlockScan(temp_storage).InclusiveScan(own, prefix, DeferredTallyAdd<F>(), tile_total);
-      const DeferredTally<F> before = carry;
-      if (row < nb_rows) {
-        cols->deferred_commits = before.count + prefix.count;
-        cols->deferred_commit_mask = before.mask + prefix.mask;
-      }
-      __syncthreads();
-      if (threadIdx.x == 0) carry = DeferredTallyAdd<F>()(before, tile_total);
-      __syncthreads();
-    }
-  }
-
-  /// Padding rows carry the last event row's tally, so the trace's last row holds the chunk's.
-  template <class F>
-  __global__ void deferred_tally_fill_kernel(
-    F* trace, const size_t num_cols, const size_t nb_rows, const size_t padded_rows)
-  {
-    const size_t row = nb_rows + blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= padded_rows) return;
-    const EcallChipColsU64<F>* last =
-      reinterpret_cast<const EcallChipColsU64<F>*>(&trace[(nb_rows - 1) * num_cols]);
-    EcallChipColsU64<F>* cols = reinterpret_cast<EcallChipColsU64<F>*>(&trace[row * num_cols]);
-    cols->deferred_commits = last->deferred_commits;
-    cols->deferred_commit_mask = last->deferred_commit_mask;
-  }
-
-  /// Turn the per-row tally shares of the first `nb_rows` rows into running sums and carry the
-  /// total through the padding rows. `nb_rows == 0` leaves the zeroed trace as it is.
-  template <class F>
-  inline void deferred_tally(
-    F* trace, const size_t num_cols, const size_t nb_rows, const size_t padded_rows,
-    cudaStream_t stream)
-  {
-    if (nb_rows == 0) return;
-    deferred_tally_scan_kernel<F><<<1, DEFERRED_TALLY_BLOCK, 0, stream>>>(trace, num_cols, nb_rows);
-    CUDA_OK(cudaGetLastError());
-    if (padded_rows > nb_rows) {
-      const size_t pad = padded_rows - nb_rows;
-      const int block_size = 256;
-      const int grid_size = (pad + block_size - 1) / block_size;
-      deferred_tally_fill_kernel<F>
-        <<<grid_size, block_size, 0, stream>>>(trace, num_cols, nb_rows, padded_rows);
-      CUDA_OK(cudaGetLastError());
-    }
-  }
-
-  template <class F, size_t NumCols>
-  __global__ void ecall_events_to_trace_kernel(
-    const FfiCpuEventU64* events,
-    const size_t count,
-    F* trace_matrix,
-    const size_t num_cols,
-    F* byte_trace)
-  {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    const size_t stride = (NumCols > 0) ? NumCols : num_cols;
-    EcallChipColsU64<F>* cols =
-      reinterpret_cast<EcallChipColsU64<F>*>(&trace_matrix[idx * stride]);
-    event_to_row<F>(events[idx], *cols, byte_trace);
-  }
-
-  template <class F>
-  inline RustError generate_extra_record_and_main(
-    const size_t num_cols,
-    const size_t event_size,
-    const size_t trace_size,
-    const FfiCpuEventU64* events,
-    F* trace,
-    cudaStream_t stream,
-    F* byte_trace)
-  {
-    try {
-      // The mirrored struct must stay field-for-field with the Rust `#[repr(C)]` `EcallChipCols`;
-      // a width that disagrees means the two have drifted, and writing at this struct's offsets
-      // would fill the wrong columns, so it is refused.
-      constexpr int NUM_ECALL_CHIP_COLS = sizeof(EcallChipColsU64<F>) / sizeof(F);
-      if (num_cols != NUM_ECALL_CHIP_COLS) return RustError{cudaErrorInvalidValue};
-
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
-      if (event_size == 0) return RustError{cudaSuccess};
-
-      const int block_size = 256;
-      const int grid_size = (event_size + block_size - 1) / block_size;
-      ecall_events_to_trace_kernel<F, NUM_ECALL_CHIP_COLS><<<grid_size, block_size, 0, stream>>>(
-        events, event_size, trace, num_cols, byte_trace);
-      CUDA_OK(cudaGetLastError());
-      deferred_tally<F>(trace, num_cols, event_size, trace_size / num_cols, stream);
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-
-    return RustError{cudaSuccess};
-  }
 } // namespace pico_gpu::ecall_u64

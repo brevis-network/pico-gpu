@@ -197,25 +197,6 @@ namespace pico_gpu::program_preprocess_u64 {
 namespace pico_gpu::program_u64 {
 
   template <class F>
-  __global__ void cpu_pcs_to_trace_kernel(
-    const FfiCpuEventU64* events, uint64_t pc_base, size_t count,
-    F* trace_matrix, size_t num_cols, size_t num_instrs)
-  {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    uint64_t pc = events[idx].pc;
-    uint64_t offset = pc - pc_base;
-    if (offset % 4 != 0) return;
-    uint64_t row_index = offset / 4;
-    if (row_index >= num_instrs) return;
-
-    ProgramMultCols<uint32_t>* cols = reinterpret_cast<ProgramMultCols<uint32_t>*>(
-      &trace_matrix[row_index * num_cols]);
-    atomicAdd(&cols->multiplicity, 1);
-  }
-
-  template <class F>
   __global__ void to_montgomery_kernel(size_t num_instrs, F* trace_matrix, size_t num_cols)
   {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -225,38 +206,5 @@ namespace pico_gpu::program_u64 {
       cols->multiplicity = ((uint64_t)cols->multiplicity << F::MONTY_BITS) % F::MOD;
     }
   }
-
-  template <class F>
-  inline RustError generate_main(
-    size_t num_cols,
-    size_t event_size,
-    size_t trace_size,
-    uint64_t pc_base,
-    const FfiCpuEventU64* events,
-    F* trace,
-    cudaStream_t stream,
-    size_t num_instrs = 0)
-  {
-    try {
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
-      if (event_size == 0) { return RustError{cudaSuccess}; }
-
-      const int block_size = 256;
-      size_t convert_rows = (num_instrs > 0) ? num_instrs : (trace_size / num_cols);
-
-      int grid_size = (event_size + block_size - 1) / block_size;
-      cpu_pcs_to_trace_kernel<<<grid_size, block_size, 0, stream>>>(
-        events, pc_base, event_size, trace, num_cols, convert_rows);
-      CUDA_OK(cudaGetLastError());
-
-      grid_size = (convert_rows + block_size - 1) / block_size;
-      to_montgomery_kernel<<<grid_size, block_size, 0, stream>>>(convert_rows, trace, num_cols);
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-
-    return RustError{cudaSuccess};
-  } // generate_main
 
 } // namespace pico_gpu::program_u64

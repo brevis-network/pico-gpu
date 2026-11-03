@@ -65,14 +65,15 @@ namespace pico_gpu::precompile_fp2_mul_bls12381 {
       const uint32_t grid_size = (num_rows + block_size - 1) / block_size;
 
       Scratch* d_scratch = nullptr;
-      CUDA_OK(cudaMalloc(&d_scratch, num_rows * sizeof(Scratch)));
+      // Stream-ordered: a plain cudaMalloc/cudaFree pair blocks until the whole device is idle.
+      CUDA_OK(cudaMallocAsync(&d_scratch, num_rows * sizeof(Scratch), stream));
 
       fp2_mul_kernel<F>
         <<<grid_size, block_size, 0, stream>>>(events, event_size, trace, byte_trace, num_cols, num_rows, d_scratch);
       CUDA_OK(cudaGetLastError());
 
       CUDA_OK(cudaStreamSynchronize(stream));
-      CUDA_OK(cudaFree(d_scratch));
+      CUDA_OK(cudaFreeAsync(d_scratch, stream));
     } catch (const cuda_error& e) {
       return RustError{e.code()};
     }

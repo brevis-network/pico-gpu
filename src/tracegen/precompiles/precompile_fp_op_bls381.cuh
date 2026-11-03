@@ -92,13 +92,14 @@ namespace pico_gpu::precompile_fp_op_bls381 {
       const int grid_size = (event_size + block_size - 1) / block_size;
 
       Scratch* d_scratch = nullptr;
-      CUDA_OK(cudaMalloc(&d_scratch, event_size * sizeof(Scratch)));
+      // Stream-ordered: a plain cudaMalloc/cudaFree pair blocks until the whole device is idle.
+      CUDA_OK(cudaMallocAsync(&d_scratch, event_size * sizeof(Scratch), stream));
 
       events_to_rows_kernel<<<grid_size, block_size, 0, stream>>>(events, trace, byte_trace, event_size, num_cols, d_scratch);
       CUDA_OK(cudaGetLastError());
 
       CUDA_OK(cudaStreamSynchronize(stream));
-      CUDA_OK(cudaFree(d_scratch));
+      CUDA_OK(cudaFreeAsync(d_scratch, stream));
     } catch (const cuda_error& e) {
       return RustError{e.code()};
     }

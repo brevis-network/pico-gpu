@@ -202,6 +202,35 @@ namespace pico_gpu::byte {
     return RustError{cudaSuccess};
   }
 
+  /// Kernel adding a table of raw counts, laid out as the byte table is before the finalize, into
+  /// it. The adds are atomic, so they commute with every device writer's counts and need no wait on
+  /// them; only the finalize has to come after. `overflow` is set when a cell would reach the field
+  /// order, which the finalize would read as a different element.
+  template <class F>
+  __global__ void add_raw_counts_kernel(F* trace_matrix, const uint32_t* delta, const size_t n, uint32_t* overflow)
+  {
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const uint32_t d = delta[idx];
+    if (d == 0) return;
+    uint32_t* raw_ptr = reinterpret_cast<uint32_t*>(&trace_matrix[idx]);
+    const uint32_t old = atomicAdd(raw_ptr, d);
+    if (d >= F::MOD || old >= F::MOD - d) atomicOr(overflow, 1u);
+  }
+
+  /// Add `d_delta`'s raw counts into `d_byte_trace`, both `byte_trace_size` cells, on `stream`.
+  template <class F>
+  inline RustError add_raw_counts(
+    F* d_byte_trace, const uint32_t* d_delta, const size_t byte_trace_size, uint32_t* d_overflow, cudaStream_t stream)
+  {
+    if (byte_trace_size == 0) return RustError{cudaSuccess};
+
+    const int block_size = 256;
+    const int grid_size = (byte_trace_size + block_size - 1) / block_size;
+    add_raw_counts_kernel<F><<<grid_size, block_size, 0, stream>>>(d_byte_trace, d_delta, byte_trace_size, d_overflow);
+    return RustError{cudaGetLastError()};
+  }
+
   /// Handle byte lookup event by incrementing the corresponding trace entry.
   /// On Volta+ (CC >= 7.0), uses warp-aggregated atomics: threads in the same
   /// warp targeting the same trace_index are grouped via __match_any_sync, and

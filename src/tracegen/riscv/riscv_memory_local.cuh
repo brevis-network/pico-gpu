@@ -10,6 +10,7 @@
 #include "common/rusterror.h"
 
 #include "tracegen/common/prelude.cuh"
+#include "tracegen/common/step_events.cuh"
 #include "tracegen/common/utils.cuh"
 #include "tracegen/riscv/byte.cuh"
 
@@ -17,6 +18,12 @@
 // ─── U64 Memory Local ───────────────────────────────────────────────
 namespace pico_gpu::riscv_memory_local_u64 {
   using namespace pico_gpu;
+
+  /// What a caller's step events bracket (`StepEvents`), in their order.
+  namespace step {
+    constexpr size_t MEMSET = 0;
+    constexpr size_t FILL = 1;
+  } // namespace step
 
   __device__ inline void build_global_message_u64(
     uint32_t* message, uint32_t chunk, uint32_t clk, uint64_t addr, uint64_t value)
@@ -185,7 +192,8 @@ namespace pico_gpu::riscv_memory_local_u64 {
     cudaStream_t stream,
     GlobalInteractionEvent* global_events,
     const size_t global_events_start_index,
-    F* byte_trace)
+    F* byte_trace,
+    StepEvents* steps = nullptr)
   {
     // `num_cols` is the per-entry stride the kernel writes SingleMemoryLocalU64 at, and Rust
     // derives it from its own struct -- so this checks that the hand-maintained CUDA mirror still
@@ -198,15 +206,19 @@ namespace pico_gpu::riscv_memory_local_u64 {
     }
 
     try {
+      step_begin(steps, step::MEMSET, stream);
       CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+      step_end(steps, step::MEMSET, stream);
       if (event_size == 0) return RustError{cudaSuccess};
 
       const int block_size = 256;
       const int grid_size = (event_size + block_size - 1) / block_size;
 
+      step_begin(steps, step::FILL, stream);
       events_to_trace_with_extra_record_kernel<<<grid_size, block_size, 0, stream>>>(
         event_size, events, trace, num_cols, global_events, global_events_start_index, byte_trace);
       CUDA_OK(cudaGetLastError());
+      step_end(steps, step::FILL, stream);
     } catch (const cuda_error& e) {
       return RustError{e.code()};
     }

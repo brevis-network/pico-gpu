@@ -65,7 +65,8 @@ namespace pico_gpu::keccak {
 
       // Allocate device memory for Keccak column pointers.
       KeccakCols<F>** d_keccak_ptrs;
-      CUDA_OK(cudaMalloc(&d_keccak_ptrs, rows_total * sizeof(KeccakCols<F>*)));
+      // Stream-ordered: a plain cudaMalloc/cudaFree pair blocks until the whole device is idle.
+      CUDA_OK(cudaMallocAsync(&d_keccak_ptrs, rows_total * sizeof(KeccakCols<F>*), stream));
 
       // Launch kernel.
       const int block_size = 256;
@@ -75,7 +76,7 @@ namespace pico_gpu::keccak {
         events, event_size, events_total, rows_total, trace, num_cols, d_keccak_ptrs);
       CUDA_OK(cudaGetLastError());
 
-      CUDA_OK(cudaFree(d_keccak_ptrs));
+      CUDA_OK(cudaFreeAsync(d_keccak_ptrs, stream));
     } catch (const cuda_error& e) {
       return RustError{e.code()};
     }

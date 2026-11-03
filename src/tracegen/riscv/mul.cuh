@@ -48,44 +48,4 @@ namespace pico_gpu::mul_u64 {
     cols.is_mulhsu = F::from_bool(is_mulhsu);
     cols.is_mulw = F::from_bool(is_mulw);
   }
-
-  template <class F>
-  __global__ void mul_events_to_trace_kernel(
-    const AluEventU64* events, const size_t count,
-    F* trace_matrix, const size_t num_cols, F* byte_trace)
-  {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= count) return;
-
-    MulValueColsU64<F>* cols =
-      reinterpret_cast<MulValueColsU64<F>*>(&trace_matrix[idx * num_cols]);
-    event_to_row<F>(events[idx], *cols, byte_trace);
-  }
-
-  template <class F>
-  inline RustError generate_extra_record_and_main(
-    const size_t num_cols,
-    const size_t event_size,
-    const size_t trace_size,
-    const AluEventU64* events,
-    F* trace,
-    F* byte_trace,
-    cudaStream_t stream)
-  {
-    try {
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
-      if (event_size == 0) return RustError{cudaSuccess};
-
-      const int block_size = 256;
-      const int grid_size = (event_size + block_size - 1) / block_size;
-
-      mul_events_to_trace_kernel<<<grid_size, block_size, 0, stream>>>(
-        events, event_size, trace, num_cols, byte_trace);
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-
-    return RustError{cudaSuccess};
-  }
 } // namespace pico_gpu::mul_u64

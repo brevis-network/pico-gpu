@@ -572,8 +572,9 @@ namespace pico_gpu::divrem {
 
     // ── Generate dependent ALU events ───────────────────────────────
 
-    // Add events for absolute value computation. At most two, and the packed wrapper in
-    // packed_tracegen.cuh sizes a stack array on that — a third emitter here overruns it.
+    // Add events for absolute value computation. At most two, and the div/rem history kernel
+    // stages two slots per row on that (history_add_sub_divrem.cuh) — a third emitter here
+    // overruns the next row's.
     // Build each event zero-initialized (as cpu.cuh does) and store it whole: the slots come
     // from a reused device pool, so writing only clk/opcode/a/b/c left `is_imm` / `is_cmp` and
     // the padding holding whatever the previous tenant wrote.
@@ -629,70 +630,5 @@ namespace pico_gpu::divrem {
     write_word_from_u64(cols.max_abs_c_or_1, 1);
     cols.b_not_neg_not_overflow = F::one();
     populate_is_zero_word_u64(cols.is_c_0, 1);
-  }
-
-  // ─── Kernel ──────────────────────────────────────────────────────────
-
-  template <class F>
-  __global__ void events_to_trace_kernel(
-    const size_t event_size,
-    const size_t trace_size,
-    const AluEventU64* events,
-    F* trace_matrix,
-    const size_t num_cols,
-    const DivremExtraEventIndices* extra_event_indices,
-    F* byte_trace,
-    AluEventU64* alu_add_sub_events,
-    const size_t alu_add_sub_events_start_index)
-  {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx * num_cols < trace_size) {
-      DivRemValueColsU64<F>* cols =
-        reinterpret_cast<DivRemValueColsU64<F>*>(&trace_matrix[idx * num_cols]);
-
-      if (idx < event_size) {
-        event_to_row<F>(
-          events[idx], *cols, byte_trace,
-          &alu_add_sub_events[alu_add_sub_events_start_index + extra_event_indices[idx].add]);
-      } else {
-        assign_padding_row<F>(*cols);
-      }
-    }
-  }
-
-  // ─── Entry point ─────────────────────────────────────────────────────
-
-  template <class F>
-  inline RustError generate_extra_record_and_main(
-    const size_t num_cols,
-    const size_t event_size,
-    const size_t trace_size,
-    const AluEventU64* events,
-    F* trace,
-    cudaStream_t stream,
-    const DivremExtraEventIndices* extra_event_indices,
-    F* byte_trace,
-    AluEventU64* alu_add_sub_events,
-    const size_t alu_add_sub_events_start_index)
-  {
-    try {
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
-      // No early return on zero events: a whitelist shape can list this chip with no events,
-      // and its padding row is not all-zero, so the kernel runs over every row and writes it.
-
-      const int block_size = 256;
-      const int num_rows = trace_size / num_cols;
-      const int grid_size = (num_rows + block_size - 1) / block_size;
-
-      events_to_trace_kernel<<<grid_size, block_size, 0, stream>>>(
-        event_size, trace_size, events, trace, num_cols, extra_event_indices,
-        byte_trace,
-        alu_add_sub_events, alu_add_sub_events_start_index);
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-
-    return RustError{cudaSuccess};
   }
 } // namespace pico_gpu::divrem

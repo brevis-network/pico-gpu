@@ -28,10 +28,18 @@ fn main() {
         "cargo:rerun-if-changed={}",
         base_dir.join("third_party").to_string_lossy()
     );
-    println!(
-        "cargo:rerun-if-changed={}",
-        base_dir.join("src").to_string_lossy()
-    );
+    // src/ is watched entry by entry, all but tracegen: that directory is compiled by pico-gpu-api,
+    // which fingerprints what it reads by content, and a watch on it here would rerun this script
+    // (and through its `links` key every dependent script) on each edit under it.
+    let mut src_entries: Vec<PathBuf> = std::fs::read_dir(base_dir.join("src"))
+        .expect("can not list pico-gpu src")
+        .map(|entry| entry.expect("can not read an entry of pico-gpu src").path())
+        .filter(|path| path.file_name().is_some_and(|name| name != "tracegen"))
+        .collect();
+    src_entries.sort();
+    for entry in src_entries {
+        println!("cargo:rerun-if-changed={}", entry.to_string_lossy());
+    }
 
     // This build.rs only exports the root path and sets up rerun conditions
 }
