@@ -147,6 +147,11 @@ namespace pico_gpu::divrem {
 
   __device__ inline uint8_t get_msb_u64(uint64_t a) { return (uint8_t)((a >> 63) & 1); }
 
+  /// |a| for `a` read as signed, in unsigned arithmetic: INT64_MIN maps to 2^63, as the host's
+  /// `wrapping_abs` does. Negating it as `int64_t` would overflow, which the compiler may assume
+  /// never happens and so clear bit 63.
+  __device__ inline uint64_t unsigned_abs(uint64_t a) { return (int64_t)a < 0 ? 0 - a : a; }
+
   // ─── Quotient / remainder (matching Rust get_quotient_and_remainder) ──
 
   __device__ inline void get_qr_u64(
@@ -439,8 +444,8 @@ namespace pico_gpu::divrem {
       cols.c_neg   = F::from_canonical_u8(get_msb_u64(event.c));
       cols.is_overflow = F::from_bool((int64_t)event.b == INT64_MIN && (int64_t)event.c == -1);
 
-      uint64_t abs_rem = (uint64_t)( ((int64_t)remainder < 0) ? -(int64_t)remainder : (int64_t)remainder );
-      uint64_t abs_c_val = (uint64_t)( ((int64_t)event.c < 0) ? -(int64_t)event.c : (int64_t)event.c );
+      uint64_t abs_rem = unsigned_abs(remainder);
+      uint64_t abs_c_val = unsigned_abs(event.c);
       write_word_from_u64(cols.abs_remainder, abs_rem);
       write_word_from_u64(cols.abs_c, abs_c_val);
       uint64_t max_c = abs_c_val > 1 ? abs_c_val : 1;
@@ -451,8 +456,8 @@ namespace pico_gpu::divrem {
       cols.c_neg   = F::from_canonical_u8(get_msb_u64((uint64_t)(int64_t)(int32_t)event.c));
       cols.is_overflow = F::from_bool((int32_t)event.b == INT32_MIN && (int32_t)event.c == -1);
 
-      uint64_t abs_rem = (uint64_t)( ((int64_t)remainder < 0) ? -(int64_t)remainder : (int64_t)remainder );
-      uint64_t abs_c_val = (uint64_t)( ((int64_t)c_comp < 0) ? -(int64_t)c_comp : (int64_t)c_comp );
+      uint64_t abs_rem = unsigned_abs(remainder);
+      uint64_t abs_c_val = unsigned_abs(c_comp);
       write_word_from_u64(cols.abs_remainder, abs_rem);
       write_word_from_u64(cols.abs_c, abs_c_val);
       uint64_t max_c = abs_c_val > 1 ? abs_c_val : 1;
