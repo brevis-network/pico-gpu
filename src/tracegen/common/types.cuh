@@ -1035,24 +1035,6 @@ namespace pico_gpu {
     uint32_t _pad2;
   };
 
-  // Slimmed version of FfiCpuEventU64 for the GPU trace kernel.
-  // Excludes memory, memory_record, and exit_code which are unused by the
-  // riscv_cpu kernel, reducing per-event size from 304 to 232 bytes (~24%).
-  struct FfiCpuEventSlimU64 {
-    uint32_t chunk;
-    uint32_t _pad1;
-    uint64_t clk;
-    uint64_t pc;
-    uint64_t next_pc;
-    InstructionU64 instruction;
-    uint64_t a;
-    FfiOption<MemoryRecordEnumU64> a_record;
-    uint64_t b;
-    FfiOption<MemoryRecordEnumU64> b_record;
-    uint64_t c;
-    FfiOption<MemoryRecordEnumU64> c_record;
-  };
-
   template <typename F>
   struct Addr {
     F _0[3];
@@ -1118,7 +1100,7 @@ namespace pico_gpu {
     F is_halt;
     F is_real;
     /// The chain's sink (Rust `CpuCols::is_last`). Written by the HOST after the slice launches,
-    /// never by a kernel: `cpu_events_to_trace_kernel` is launched once per slice, so a
+    /// never by a kernel: `cpu_history_slice_kernel` is launched once per slice, so a
     /// kernel-side "last index" test would mark the last row of every slice.
     F is_last;
     // Multiplicity of the ALU dispatch: is_alu_instruction * (1 - op_a_0). Precomputed
@@ -2747,15 +2729,5 @@ namespace pico_gpu {
   enum class SyscallChunkKind : uint8_t {
     Riscv = 0,
     Precompile = 1,
-  };
-
-  struct CpuExtraEventIndices {
-    size_t add;
-    size_t lt;
-  };
-
-  struct DivremExtraEventIndices {
-    size_t add;
-    size_t lt;
   };
 } // namespace pico_gpu

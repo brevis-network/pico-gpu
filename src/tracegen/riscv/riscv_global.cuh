@@ -15,6 +15,7 @@
 #include "tracegen/common/types.cuh"
 #include "tracegen/common/global_interaction.cuh"
 #include "tracegen/common/global_accumulation.cuh"
+#include "tracegen/common/step_events.cuh"
 #include "tracegen/common/utils.cuh"
 #include "tracegen/riscv/byte.cuh"
 #include "tracegen/riscv/riscv_global_septic_local.cuh"
@@ -23,6 +24,18 @@ using namespace poseidon2;
 
 namespace pico_gpu::riscv_global {
   using namespace pico_gpu::byte;
+
+  /// What a caller's step events bracket (`StepEvents`), in their order. The scan's three levels
+  /// are its top call's: the block scan, the scan of the block sums (with any level below it), and
+  /// the add of the block prefixes.
+  namespace step {
+    constexpr size_t MEMSET = 0;
+    constexpr size_t CONVERT = 1;
+    constexpr size_t SCAN_BLOCKS = 2;
+    constexpr size_t SCAN_SUMS = 3;
+    constexpr size_t SCAN_PREFIX = 4;
+    constexpr size_t ACCUMULATE = 5;
+  } // namespace step
 
   struct GlobalExtraEventIndices {
     size_t byte;
@@ -442,7 +455,12 @@ namespace pico_gpu::riscv_global {
   /// Perform CUB-based elliptic curve scan.
   template <class F>
   inline RustError
-  cub_elliptic_curve_scan(const septic_curve_t* d_input, septic_curve_t* d_output, const size_t n, cudaStream_t stream)
+  cub_elliptic_curve_scan(
+    const septic_curve_t* d_input,
+    septic_curve_t* d_output,
+    const size_t n,
+    cudaStream_t stream,
+    StepEvents* steps = nullptr)
   {
     if (n == 0) return RustError{cudaSuccess};
 
@@ -451,13 +469,16 @@ namespace pico_gpu::riscv_global {
 
     if (NUM_BLOCKS == 1) {
       // Single block processing with safety checks.
+      step_begin(steps, step::SCAN_BLOCKS, stream);
       cub_scan_kernel<F><<<1, BLOCK_SIZE, 0, stream>>>(d_input, d_output, nullptr, n);
+      step_end(steps, step::SCAN_BLOCKS, stream);
 
     } else {
       // Multi-block processing with safety checks.
       dev_ptr_t<septic_curve_t> d_block_sums{NUM_BLOCKS, stream};
 
       // Phase 1: Each block performs local scan.
+      step_begin(steps, step::SCAN_BLOCKS, stream);
       cub_scan_kernel<F><<<NUM_BLOCKS, BLOCK_SIZE, 0, stream>>>(d_input, d_output, &d_block_sums[0], n);
 
       cudaError_t err1 = cudaGetLastError();
@@ -465,8 +486,10 @@ namespace pico_gpu::riscv_global {
         printf("Phase 1 error: %s\n", cudaGetErrorString(err1));
         return RustError{err1};
       }
+      step_end(steps, step::SCAN_BLOCKS, stream);
 
       // Phase 2: Scan the block sums.
+      step_begin(steps, step::SCAN_SUMS, stream);
       if (NUM_BLOCKS <= BLOCK_SIZE) {
         cub_scan_kernel<F><<<1, NUM_BLOCKS, 0, stream>>>(&d_block_sums[0], &d_block_sums[0], nullptr, NUM_BLOCKS);
       } else {
@@ -480,8 +503,10 @@ namespace pico_gpu::riscv_global {
         printf("Phase 2 error: %s\n", cudaGetErrorString(err2));
         return RustError{err2};
       }
+      step_end(steps, step::SCAN_SUMS, stream);
 
       // Phase 3: Add block prefixes (also uses safe addition).
+      step_begin(steps, step::SCAN_PREFIX, stream);
       add_block_prefix_kernel<F><<<NUM_BLOCKS, BLOCK_SIZE, 0, stream>>>(d_output, &d_block_sums[0], n);
 
       cudaError_t err3 = cudaGetLastError();
@@ -489,6 +514,7 @@ namespace pico_gpu::riscv_global {
         printf("Phase 3 error: %s\n", cudaGetErrorString(err3));
         return RustError{err3};
       }
+      step_end(steps, step::SCAN_PREFIX, stream);
     }
 
     return RustError{cudaSuccess};
@@ -506,10 +532,13 @@ namespace pico_gpu::riscv_global {
     F* byte_trace,
     Poseidon2Event* poseidon2_events,
     const size_t poseidon2_events_start_index,
-    const F* round_constants)
+    const F* round_constants,
+    StepEvents* steps = nullptr)
   {
     try {
+      step_begin(steps, step::MEMSET, stream);
       CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+      step_end(steps, step::MEMSET, stream);
 
       const int block_size = 256;
       const size_t padded_event_size = trace_size / num_cols;
@@ -528,20 +557,23 @@ namespace pico_gpu::riscv_global {
         const int num_rows = trace_size / num_cols;
         const int grid_size = (num_rows + block_size - 1) / block_size;
 
+        step_begin(steps, step::CONVERT, stream);
         launch_events_to_trace_with_extra_record_landed<F>(stream, dim3(grid_size, 1, 1), dim3(block_size, 1, 1),
           event_size, trace_size, events, trace, num_cols, round_constants, &d_curve_points[0], byte_trace,
           &poseidon2_events[poseidon2_events_start_index]);
+        step_end(steps, step::CONVERT, stream);
 
         CUDA_OK(cudaStreamSynchronize(stream));
 
         // Use CUB instead of Thrust for inclusive scan.
         RustError scan_result =
-          cub_elliptic_curve_scan<F>(&d_curve_points[0], &d_curve_points[0], event_size + 1, stream);
+          cub_elliptic_curve_scan<F>(&d_curve_points[0], &d_curve_points[0], event_size + 1, stream, steps);
         if (scan_result.code != cudaSuccess) return scan_result;
       }
 
       // Launch accumulation kernel.
       const int accumulate_grid_size = (padded_event_size + block_size - 1) / block_size;
+      step_begin(steps, step::ACCUMULATE, stream);
 
       // Thread-per-cell fast path: only when the runtime width matches the compile-time
       // GlobalCols layout the TPC kernels hardcode (54 u32 cols) and the cell indices fit u32
@@ -575,6 +607,7 @@ namespace pico_gpu::riscv_global {
           d_curve_points[event_size], &d_curve_points[0], padded_event_size, event_size, trace, num_cols);
       }
       CUDA_OK(cudaGetLastError());
+      step_end(steps, step::ACCUMULATE, stream);
 
     } catch (const cuda_error& e) {
       return RustError{e.code()};

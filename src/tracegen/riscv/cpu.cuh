@@ -19,10 +19,6 @@
 
 
 // ─── U64 CPU chip ──────────────────────────────────────────────────────
-// NOTE: `event_to_row` and the `populate_*` helpers it calls are hand-mirrored by
-// `cpu_u64_packed::event_to_row_packed` in packed_tracegen.cuh, which fills the same columns from
-// the packed event. Nothing makes the compiler check the two against each other — edit both, or
-// MLE_PACKED_EVENTS=1 silently builds a different trace.
 namespace pico_gpu::cpu_u64 {
   using namespace byte;
   using divrem::write_word_from_u64;
@@ -171,7 +167,7 @@ namespace pico_gpu::cpu_u64 {
 
       // One merged comparison event (mirrors Rust `populate_branch`): the Lt row pins both bits,
       // `a[0] = a_lt_b`, `a[1] = a_gt_b`. One lt slot per branch -- must stay in step with the
-      // Rust `count_cpu_event` and the packed mirror in packed_tracegen.cuh.
+      // Rust `count_cpu_event`.
       AluEventU64 cmp_event = {};
       cmp_event.clk = event.clk;
       cmp_event.opcode = alu_op_code;
@@ -305,164 +301,6 @@ namespace pico_gpu::cpu_u64 {
     cols.jalr_lsb = (event.instruction.opcode == Opcode::JALR)
                         ? F::from_canonical_u32(static_cast<uint32_t>((event.b + event.c) & 1ull))
                         : F::zero();
-  }
-
-  template <class F, size_t NumCols>
-  __global__ void cpu_events_to_trace_kernel(
-    const size_t event_size,
-    const FfiCpuEventU64* __restrict__ events,
-    F* __restrict__ trace_matrix,
-    const size_t num_cols,
-    const CpuExtraEventIndices* __restrict__ extra_event_indices,
-    F* __restrict__ byte_trace,
-    // The ADD/SUB buffer and its start index stay in the kernel and FFI signature (the host
-    // hands them over for every chip) but no Cpu row writes an ADD event, so neither is read;
-    // `extra_event_indices[idx].add` is always 0.
-    AluEventU64* /*alu_add_sub_events*/,
-    const size_t /*alu_add_sub_events_start_index*/,
-    AluEventU64* alu_lt_events,
-    const size_t alu_lt_events_start_index)
-  {
-    // No bulk chunk U16 event here: the chunk lookup is gone on both sides. If it ever comes
-    // back, emit it from exactly one place -- this prologue with multiplicity event_size, or a
-    // per-row copy in populate_chunk_clk, never both. Keeping the prologue while deleting only
-    // the per-row copy is what unbalanced the byte multiset before.
-
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if constexpr (NumCols > 0 && NumCols == sizeof(CpuColsU64<F>) / sizeof(F) &&
-                  sizeof(F) == sizeof(uint32_t)) {
-      // WSTAGE fast path (compile-time-width specialization only): the 32 rows of a warp form
-      // ONE contiguous row-major span in the trace. Each thread builds its row in dynamic
-      // shared memory, then the warp flushes the whole span linearly = fully coalesced 128B
-      // stores, removing the ~8x sector amplification of per-thread strided row stores
-      // (4.4x standalone). Byte-identical: the staged row is zero-initialized and flushed in
-      // full, matching the pre-zeroed buffer; event_to_row and the byte/ALU side effects run
-      // unmodified.
-      extern __shared__ uint32_t wstage_smem[];
-      const int warp = threadIdx.x >> 5;
-      const int lane = threadIdx.x & 31;
-      uint32_t* wrow = wstage_smem + (size_t)warp * 32 * NumCols; // this warp's 32xNumCols tile
-      uint32_t* myrow = wrow + (size_t)lane * NumCols;            // this thread's staged row
-#pragma unroll
-      for (int i = 0; i < (int)NumCols; i++) myrow[i] = 0u;
-      __syncwarp();
-      if (idx < event_size) {
-        CpuColsU64<F>* cols = reinterpret_cast<CpuColsU64<F>*>(myrow);
-        event_to_row<F>(
-          events[idx], *cols, byte_trace,
-          &alu_lt_events[alu_lt_events_start_index + extra_event_indices[idx].lt]);
-      }
-      __syncwarp();
-      const size_t warp_base = (size_t)blockIdx.x * blockDim.x + (size_t)warp * 32;
-      if (warp_base < event_size) {
-        const size_t rem = event_size - warp_base;
-        const int words = (rem >= 32 ? 32 : (int)rem) * (int)NumCols;
-        uint32_t* out = reinterpret_cast<uint32_t*>(&trace_matrix[warp_base * NumCols]);
-        for (int k = lane; k < words; k += 32) out[k] = wrow[k];
-      }
-    } else {
-      if (idx < event_size) {
-        const size_t stride = (NumCols > 0) ? NumCols : num_cols;
-        CpuColsU64<F>* cols = reinterpret_cast<CpuColsU64<F>*>(&trace_matrix[idx * stride]);
-        event_to_row<F>(
-          events[idx], *cols, byte_trace,
-          &alu_lt_events[alu_lt_events_start_index + extra_event_indices[idx].lt]);
-      }
-    }
-  }
-
-  template <class F>
-  __global__ void cpu_pad_trace_kernel(
-    const size_t num_cols, const size_t num_rows_to_pad,
-    F* __restrict__ trace_matrix_start_of_padding)
-  {
-    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_rows_to_pad) {
-      CpuColsU64<F>* cols = reinterpret_cast<CpuColsU64<F>*>(&trace_matrix_start_of_padding[idx * num_cols]);
-      assign_padding_row<F>(*cols);
-    }
-  }
-
-  template <class F>
-  inline RustError pad_trace(
-    const size_t num_cols, const size_t start_row, const size_t end_row,
-    F* trace, cudaStream_t stream)
-  {
-    try {
-      const int block_size = 256;
-
-      // Pad rows [start_row, end_row) with zeros + padding pattern
-      if (start_row < end_row) {
-        const size_t num_rows_to_pad = end_row - start_row;
-        F* trace_ptr = &trace[start_row * num_cols];
-        CUDA_OK(cudaMemsetAsync(trace_ptr, 0, num_rows_to_pad * num_cols * sizeof(F), stream));
-        const int grid_size = (num_rows_to_pad + block_size - 1) / block_size;
-        cpu_pad_trace_kernel<F><<<grid_size, block_size, 0, stream>>>(num_cols, num_rows_to_pad, trace_ptr);
-      }
-
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-    return RustError{cudaSuccess};
-  }
-
-  template <class F>
-  inline RustError generate_extra_record_and_main(
-    const size_t num_cols,
-    const size_t event_size,
-    const FfiCpuEventU64* events,
-    F* trace,
-    cudaStream_t stream,
-    const CpuExtraEventIndices* extra_event_indices,
-    F* byte_trace,
-    AluEventU64* alu_add_sub_events,
-    const size_t alu_add_sub_events_start_index,
-    AluEventU64* alu_lt_events,
-    const size_t alu_lt_events_start_index)
-  {
-    try {
-      if (event_size == 0) return RustError{cudaSuccess};
-
-      const int block_size = 256;
-      const int grid_size = (event_size + block_size - 1) / block_size;
-
-      // NOTE: this pins the dispatch against CpuColsU64 only. CpuColsU64 is a hand-maintained
-      // mirror of the Rust CpuCols — drift between the two is invisible to the compiler, and only
-      // MLE_TRACE_COMPARE catches it.
-      // Dispatch the WSTAGE fast path on the real compile-time struct width -- a hardcoded
-      // one goes stale on any column repack and silently leaves the fast path
-      // dead. Deriving it from sizeof(CpuColsU64<F>) keeps the dispatch in sync with the
-      // kernel's internal guard (NumCols == sizeof(CpuColsU64<F>)/sizeof(F)); other widths
-      // fall through to the generic (NumCols=0) path.
-      constexpr uint32_t kCpuCols = sizeof(CpuColsU64<F>) / sizeof(F);
-      // Pin the width: the Rust `NUM_CPU_COLS` is the same 58, and the host writes `is_last`
-      // into this layout by column index after the kernels run. A silent width change on either
-      // side would put that write in the wrong column.
-      static_assert(sizeof(CpuColsU64<F>) / sizeof(F) == 58, "CpuCols width drift vs Rust");
-      if (num_cols == kCpuCols) {
-        // WSTAGE launch shape: block 128 keeps the dynamic smem at
-        // 4 warps x 32 rows x kCpuCols x 4B, under the 48KB default —
-        // no cudaFuncSetAttribute opt-in needed (requesting near the ~99KB sm_120
-        // cap fails with a sticky invalid-argument error; block 256 would need it).
-        const int wstage_block = 128;
-        const int wstage_grid = (event_size + wstage_block - 1) / wstage_block;
-        const size_t wstage_shmem =
-          (size_t)(wstage_block / 32) * 32 * kCpuCols * sizeof(F);
-        cpu_events_to_trace_kernel<F, kCpuCols><<<wstage_grid, wstage_block, wstage_shmem, stream>>>(
-          event_size, events, trace, num_cols, extra_event_indices, byte_trace,
-          alu_add_sub_events, alu_add_sub_events_start_index,
-          alu_lt_events, alu_lt_events_start_index);
-      } else {
-        cpu_events_to_trace_kernel<F, 0><<<grid_size, block_size, 0, stream>>>(
-          event_size, events, trace, num_cols, extra_event_indices, byte_trace,
-          alu_add_sub_events, alu_add_sub_events_start_index,
-          alu_lt_events, alu_lt_events_start_index);
-      }
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-    return RustError{cudaSuccess};
   }
 
 } // namespace pico_gpu::cpu_u64

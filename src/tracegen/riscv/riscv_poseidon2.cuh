@@ -5,10 +5,18 @@
 
 #include "field/ff_config.hpp"
 #include "tracegen/common/poseidon2.cuh"
+#include "tracegen/common/step_events.cuh"
 
 using namespace ::pico_gpu::poseidon2;
 
 namespace pico_gpu::riscv_poseidon2 {
+  /// What a caller's step events bracket (`StepEvents`), in their order.
+  namespace step {
+    constexpr size_t MEMSET = 0;
+    constexpr size_t PERMUTE = 1;
+    constexpr size_t PAD = 2;
+  } // namespace step
+
   /// Row layout of one riscv permutation slot: rate-8 inputs only and the last ending full round
   /// committed on its 7 looked-up output lanes only (148 columns for KoalaBear).
   /// The Rust side passes `RISCV_NUM_POSEIDON2_VALUE_COLS` as `num_cols`; BOTH kernels below
@@ -240,16 +248,20 @@ namespace pico_gpu::riscv_poseidon2 {
     field_t* trace,
     field_t* dummy_row,
     const field_t* round_constants,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    StepEvents* steps = nullptr)
   {
     try {
 
       // initialize trace matrix with zeros
+      step_begin(steps, step::MEMSET, stream);
       CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(field_t), stream));
+      step_end(steps, step::MEMSET, stream);
 
       // launch kernel
       // generate real rows by events
       {
+        step_begin(steps, step::PERMUTE, stream);
         // "staged" path: register-state permutation with phased warp flush.
         // Chosen over a per-__launch_bounds__ specialized launcher, which profiled ~2.6x slower.
         if (num_cols == staged::NUM_VALUE_COLS) {
@@ -266,6 +278,7 @@ namespace pico_gpu::riscv_poseidon2 {
             events, trace, event_size, num_cols, round_constants);
         }
         CUDA_OK(cudaGetLastError());
+        step_end(steps, step::PERMUTE, stream);
       }
 
       // generate padding rows
@@ -277,9 +290,11 @@ namespace pico_gpu::riscv_poseidon2 {
 
         size_t idx_dummy_start = event_size * num_cols;
 
+        step_begin(steps, step::PAD, stream);
         pad_dummy_rows_kernel<<<grid_size, block_size, 0, stream>>>(
           &trace[idx_dummy_start], pad_size, num_cols, &dummy_row[0]);
         CUDA_OK(cudaGetLastError());
+        step_end(steps, step::PAD, stream);
       }
     } catch (const cuda_error& e) {
       return RustError{e.code()};
