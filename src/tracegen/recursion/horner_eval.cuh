@@ -15,7 +15,7 @@
 
 namespace pico_gpu::horner_eval {
 
-  // Event / Cols / Meta structs and HORNER_EVAL_DATAPAR live in types.cuh; ef4_mul lives in
+  // Event / Cols / Meta structs and HORNER_EVAL_DATAPAR live in types.cuh; ef_mul lives in
   // recursion_ef.cuh (namespace `pico_gpu`, resolved here via enclosing-namespace lookup).
 
   /// One thread per instruction: writes its len/DATAPAR contiguous rows into the device trace,
@@ -46,14 +46,12 @@ namespace pico_gpu::horner_eval {
     }
   }
 
-  /// `w` is the binomial extension constant of the field.
   template <class F>
   __global__ void
   horner_eval_events_to_trace_kernel(const HornerEvalEvent<F>* events,
                                      size_t count,
                                      F* trace_matrix,
-                                     size_t num_cols,
-                                     F w)
+                                     size_t num_cols)
   {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -63,9 +61,9 @@ namespace pico_gpu::horner_eval {
     for (uint32_t j = 0; j < HORNER_EVAL_DATAPAR; ++j) cols->coeffs[j] = ev.coeffs[j];
     cols->x = ev.x;
     // x2 = x*x, x3 = x2*x, x4 = x2*x2.
-    ef4_mul(ev.x._0, ev.x._0, cols->x2._0, w);
-    ef4_mul(cols->x2._0, ev.x._0, cols->x3._0, w);
-    ef4_mul(cols->x2._0, cols->x2._0, cols->x4._0, w);
+    ef_mul(ev.x._0, ev.x._0, cols->x2._0);
+    ef_mul(cols->x2._0, ev.x._0, cols->x3._0);
+    ef_mul(cols->x2._0, cols->x2._0, cols->x4._0);
     cols->acc = ev.acc;
   }
 
@@ -91,14 +89,12 @@ namespace pico_gpu::horner_eval {
     return RustError{cudaSuccess};
   }
 
-  /// `w` is the binomial extension constant for the field.
   template <class F>
   inline RustError
   generate_main(const HornerEvalEvent<F>* events,
                 size_t num_events,
                 F* trace,
                 size_t num_cols,
-                F w,
                 cudaStream_t stream)
   {
     try {
@@ -106,7 +102,7 @@ namespace pico_gpu::horner_eval {
       const int block_size = 256;
       int grid_size = (num_events + block_size - 1) / block_size;
       horner_eval_events_to_trace_kernel<<<grid_size, block_size, 0, stream>>>(
-          events, num_events, trace, num_cols, w);
+          events, num_events, trace, num_cols);
       CUDA_OK(cudaGetLastError());
     } catch (const cuda_error& e) { return RustError{e.code()}; }
     return RustError{cudaSuccess};

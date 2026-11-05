@@ -14,7 +14,7 @@
 
 namespace pico_gpu::gkr_sumcheck_round {
 
-  // Event / Instr / Cols structs live in types.cuh; ef4_mul lives in recursion_ef.cuh
+  // Event / Instr / Cols structs live in types.cuh; ef_mul lives in recursion_ef.cuh
   // (namespace `pico_gpu`, resolved here via enclosing-namespace lookup).
 
   template <class F>
@@ -43,14 +43,12 @@ namespace pico_gpu::gkr_sumcheck_round {
     cols->mult_eq = in.mult_eq;
   }
 
-  /// `w` is the binomial extension constant of the field.
   template <class F>
   __global__ void
   gkr_sumcheck_round_events_to_trace_kernel(const GkrSumcheckRoundEvent<F>* events,
                                             size_t count,
                                             F* trace_matrix,
-                                            size_t num_cols,
-                                            F w)
+                                            size_t num_cols)
   {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -64,7 +62,7 @@ namespace pico_gpu::gkr_sumcheck_round {
     cols->r = ev.r;
     cols->xi = ev.xi;
     cols->eq_in = ev.eq_in;
-    ef4_mul(ev.r._0, ev.r._0, cols->r_sq._0, w);
+    ef_mul(ev.r._0, ev.r._0, cols->r_sq._0);
     cols->next_claim = ev.next_claim;
     cols->eq_out = ev.eq_out;
   }
@@ -88,14 +86,12 @@ namespace pico_gpu::gkr_sumcheck_round {
     return RustError{cudaSuccess};
   }
 
-  /// `w` is the binomial extension constant for the field.
   template <class F>
   inline RustError
   generate_main(const GkrSumcheckRoundEvent<F>* events,
                 size_t num_events,
                 F* trace,
                 size_t num_cols,
-                F w,
                 cudaStream_t stream)
   {
     try {
@@ -103,7 +99,7 @@ namespace pico_gpu::gkr_sumcheck_round {
       const int block_size = 256;
       int grid_size = (num_events + block_size - 1) / block_size;
       gkr_sumcheck_round_events_to_trace_kernel<<<grid_size, block_size, 0, stream>>>(
-          events, num_events, trace, num_cols, w);
+          events, num_events, trace, num_cols);
       CUDA_OK(cudaGetLastError());
     } catch (const cuda_error& e) { return RustError{e.code()}; }
     return RustError{cudaSuccess};

@@ -6,6 +6,6 @@ states whether it is an unmodified copy or a modified one and summarises the cha
 
 | Path | Contents |
 |---|---|
-| `ff/` | Montgomery-form 32-bit field arithmetic (`mont32_t`), the KoalaBear field defined on it in the style of sppark's `ff/baby_bear.hpp` (`koala_bear.hpp`, written for this project), and the KoalaBear degree-4 extension |
+| `ff/` | Montgomery-form 32-bit field arithmetic (`mont32_t`), and the KoalaBear field defined on it in the style of sppark's `ff/baby_bear.hpp` (`koala_bear.hpp`, written for this project). The KoalaBear degree-5 extension the prover uses is `src/field/koala_bear_quintic.hpp`, outside this directory |
 | `ntt/` | The generic NTT kernels and their host-side launch parameters |
 | `ntt_koalabear/` | The KoalaBear instantiation: field and domain parameters, the bit-reversal kernel, and an `ntt.cuh` wrapper that loads those parameters ahead of the generic header |

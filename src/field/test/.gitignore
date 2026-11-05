@@ -1,0 +1,7 @@
+# build outputs and local data of the extension-field benchmark and test
+ext_bench
+ext5_test
+ptxas*.log
+regs*.txt
+run*.log
+vectors/

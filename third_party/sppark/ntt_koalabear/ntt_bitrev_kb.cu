@@ -7,9 +7,9 @@
  * (scattered 4-byte reads/writes, ~0.5 TB/s); the `_z` kernel stages
  * Z_COUNT x Z_COUNT tiles through shared memory so both global reads and
  * writes are coalesced (analysis.md §12.3).
- * _bit_rev_frac_ext permutes (EF, EF) pairs as opaque 32-byte words. _bit_rev_ext and
+ * _bit_rev_frac_ext permutes (EF, EF) pairs as opaque 40-byte words. _bit_rev_ext and
  * _bit_rev_frac_ext_build_k2 are stubbed out since the KB extension field type
- * kb31_4_t is not yet available in this library (the KB build_k2 lives in gkr.cu).
+ * is not available in this library (the KB build_k2 lives in gkr.cu).
  */
 
 #include <cstdint>
@@ -147,13 +147,20 @@ void bit_rev_permutation_z(T* out, const T* in, uint32_t lg_domain_size,
     // without "Z_COUNT <= WARP_SIZE" compiler spills 128 bytes to stack
 }
 
+static constexpr uint32_t pow2_floor(uint32_t x) {
+    uint32_t p = 1;
+    while (p * 2 <= x) p *= 2;
+    return p;
+}
+
 template<typename T>
 static int bit_rev_impl(T* d_out, const T* d_inp,
     uint32_t lg_domain_size, uint32_t padded_poly_size, uint32_t poly_count)
 {
     size_t domain_size = (size_t)1 << lg_domain_size;
-    // aim to read 4 cache lines of consecutive data per read
-    const uint32_t Z_COUNT = 256 / sizeof(T);
+    // aim to read 4 cache lines of consecutive data per read; a power of two (bit_rev on
+    // LG_Z_COUNT bits), so a 40-byte element gets 4 rather than 6
+    constexpr uint32_t Z_COUNT = pow2_floor(256 / sizeof(T));
     const uint32_t bsize = Z_COUNT > WARP_SIZE ? Z_COUNT : WARP_SIZE;
 
     if (poly_count == 0)
@@ -226,13 +233,13 @@ extern "C" int _kb_bit_rev_ext(void*, const void*, uint32_t, uint32_t, uint32_t)
     return cudaErrorNotSupported;
 }
 
-// One (numerator, denominator) pair of degree-4 extension elements: 8 words, 32 bytes, 4-byte
+// One (numerator, denominator) pair of KoalaBear^5 elements: 10 words, 40 bytes, 4-byte
 // aligned -- the layout of Rust's `(EF, EF)`. The permutation only moves elements, so it needs the
 // size and nothing of the field; words stay in Montgomery form.
 struct kb_frac_ext_words_t {
-    uint32_t w[8];
+    uint32_t w[10];
 };
-static_assert(sizeof(kb_frac_ext_words_t) == 32, "frac ext pair must be 32 bytes");
+static_assert(sizeof(kb_frac_ext_words_t) == 40, "frac ext pair must be 40 bytes");
 
 extern "C" int _kb_bit_rev_frac_ext(kb_frac_ext_words_t* d_out, const kb_frac_ext_words_t* d_inp,
     uint32_t lg_domain_size, uint32_t padded_poly_size, uint32_t poly_count)

@@ -5,22 +5,27 @@
 /*
  * KoalaBear extension field override for GPU proving kernels.
  *
- * Wraps kb31_4_t. Included as "field/fpext.h", so that FpExt = kb31_4_t for all
+ * Wraps kb31_5_t. Included as "field/fpext.h", so that FpExt = kb31_5_t for all
  * KB kernel code.
  *
- * KoalaBear^4 = KoalaBear[x] / (x^4 - 3)
+ * KoalaBear^5 = KoalaBear[x] / (x^5 + x^2 - 1)
  */
 
 #pragma once
 
-#include "field/fp.h"   // KB override of fp.h => Fp = kb31_t
+#include <type_traits>
 
-/// Element of GF(p^4) = GF(p)[X] / (X^4 - 3), stored as the coefficients
-/// elems[0] + elems[1]*X + elems[2]*X^2 + elems[3]*X^3 with each elems[k] an Fp (kb31_t).
+#include "field/fp.h"   // KB override of fp.h => Fp = kb31_t
+#include "field/koala_bear_quintic.hpp"
+
+/// Element of GF(p^5) = GF(p)[X] / (X^5 + X^2 - 1), stored as the coefficients
+/// elems[0] + elems[1]*X + ... + elems[4]*X^4 with each elems[k] an Fp (kb31_t).
 struct FpExt {
+    static constexpr uint32_t D = 5;
+
     union {
-        Fp       elems[4];
-        kb31_4_t rep;
+        Fp       elems[D];
+        kb31_5_t rep;
     };
 
     /// The zero element.
@@ -32,12 +37,13 @@ struct FpExt {
     /// Embeds a base-field element.
     __device__ explicit FpExt(Fp base) : rep(static_cast<kb31_t>(base)) {}
 
-    /// Builds an element from its four coefficients, lowest degree first.
-    __device__ FpExt(Fp c0, Fp c1, Fp c2, Fp c3) {
+    /// Builds an element from its five coefficients, lowest degree first.
+    __device__ FpExt(Fp c0, Fp c1, Fp c2, Fp c3, Fp c4) {
         elems[0] = c0;
         elems[1] = c1;
         elems[2] = c2;
         elems[3] = c3;
+        elems[4] = c4;
     }
 
     __device__ FpExt operator+=(FpExt addend) {
@@ -105,13 +111,19 @@ __device__ inline FpExt pow(FpExt base, I e) {
     return pow(base, static_cast<uint32_t>(e));
 }
 
-/// Multiplicative inverse, delegated to kb31_4_t::reciprocal().
+/// Multiplicative inverse, delegated to kb31_5_t::reciprocal().
 __device__ inline FpExt inv(FpExt elem) {
     FpExt recip;
     recip.rep = elem.rep.reciprocal();
     return recip;
 }
 
-static_assert(sizeof(FpExt) == 16, "FpExt must be 16 bytes");
-static_assert(sizeof(FpExt) == sizeof(kb31_4_t),   "FpExt and kb31_4_t sizes must match");
-static_assert(alignof(FpExt) == alignof(kb31_4_t), "FpExt and kb31_4_t align must match");
+// The Rust side's extension element is QuinticTrinomialExtensionField<KoalaBear>,
+// repr(transparent) over [KoalaBear; 5]: 20 packed bytes, 4-byte aligned, and FpExt crosses the
+// FFI by value. A non-trivial copy would make C++ pass it by hidden reference while Rust passes
+// it by value, so trivial copyability is part of the ABI.
+static_assert(sizeof(FpExt) == 20, "FpExt must be 20 packed bytes");
+static_assert(alignof(FpExt) == 4, "FpExt must be 4-byte aligned, like [KoalaBear; 5]");
+static_assert(sizeof(FpExt) == sizeof(kb31_5_t),   "FpExt and kb31_5_t sizes must match");
+static_assert(alignof(FpExt) == alignof(kb31_5_t), "FpExt and kb31_5_t align must match");
+static_assert(std::is_trivially_copyable_v<FpExt>, "FpExt crosses the FFI by value");
