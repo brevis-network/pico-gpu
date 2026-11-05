@@ -447,6 +447,13 @@ struct alignas(16) PackedRule {
 static_assert(sizeof(PackedRule) == 16, "PackedRule must be 16 bytes");
 static_assert(alignof(PackedRule) == 16, "PackedRule must be uint4-aligned");
 
+// Byte offset of the staged rule stream: past the warp-sum slots (one FpExt per warp), rounded
+// up to 16 so the uint4 stores into it stay aligned. FpExt is 20 bytes, so an odd warp count
+// would otherwise leave it 4-byte aligned.
+__host__ __device__ __forceinline__ size_t stage_offset(uint32_t red_fpext) {
+    return ((size_t)red_fpext * sizeof(FpExt) + 15) & ~(size_t)15;
+}
+
 // PK_* bit layout is PRIVATE TO THIS NAMESPACE — packed and unpacked only by this file's own
 // kernels. Three namespaces declare these same names, and bit 3 does NOT mean the same thing:
 //   logup_pred (batch_mle.cu)        PK_BUF @3
@@ -586,7 +593,7 @@ __global__ void logup_batch_mle_kernel_pred(
         size_t need = actx.rules_len * sizeof(PackedRule)
                     + actx.used_nodes_len * sizeof(size_t);
         if (need <= (size_t)stage_region_bytes) {
-            char *stage_base = smem + (size_t)red_fpext * sizeof(FpExt);
+            char *stage_base = smem + logup_pred::stage_offset(red_fpext);
             uint4 *s_packed4 = reinterpret_cast<uint4 *>(stage_base);
             const uint4 *g_packed4 = reinterpret_cast<const uint4 *>(packed_src);
             for (uint32_t i = threadIdx.x; i < actx.rules_len; i += blockDim.x) {
@@ -1403,7 +1410,7 @@ extern "C" int _kb_logup_batch_eval_mle(
     }
     dim3 launch_grid(n_blocks, x_count);
     dim3 launch_block(block_threads);
-    size_t scratch_bytes = div_ceil(launch_block.x, WARP_SIZE) * sizeof(FpExt);
+    size_t scratch_bytes = logup_pred::stage_offset(div_ceil(launch_block.x, WARP_SIZE));
 
     // PSI: build/reuse the per-AIR PackedRule caches + a small per-launch (air_idx -> ref) table.
     // logup_ctx_tab lives on the device (uploaded fresh by Rust each call), so D2H a POD mirror to

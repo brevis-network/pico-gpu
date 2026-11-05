@@ -1,23 +1,36 @@
 // Copyright (c) 2025-2026 Brevis.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Shared degree-4 binomial-extension (X^4 - W) multiply for recursion chips.
+// Shared extension-field multiply for recursion chips: KoalaBear^5 = F[X] / (X^5 + X^2 - 1).
 
 #pragma once
 
 namespace pico_gpu {
 
-  // out = a * b in the degree-4 binomial extension with constant `w`; matches the Rust `ef_mul`.
+  // out = a * b in the quintic trinomial extension; matches Plonky3's `trinomial_quintic_mul`,
+  // which the Rust tracegens call. Every product is formed before `out` is written, so `out` may
+  // alias an input.
   template <class F>
   __device__ __forceinline__ void
-  ef4_mul(const F* a, const F* b, F* out, const F& w)
+  ef_mul(const F* a, const F* b, F* out)
   {
-    F a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
-    F b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
-    out[0] = a0 * b0 + w * (a1 * b3 + a2 * b2 + a3 * b1);
-    out[1] = a0 * b1 + a1 * b0 + w * (a2 * b3 + a3 * b2);
-    out[2] = a0 * b2 + a1 * b1 + a2 * b0 + w * (a3 * b3);
-    out[3] = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0;
+    // Convolution c_k = sum_{i+j=k} a_i b_j.
+    F c0 = a[0] * b[0];
+    F c1 = a[0] * b[1] + a[1] * b[0];
+    F c2 = a[0] * b[2] + a[1] * b[1] + a[2] * b[0];
+    F c3 = a[0] * b[3] + a[1] * b[2] + a[2] * b[1] + a[3] * b[0];
+    F c4 = a[0] * b[4] + a[1] * b[3] + a[2] * b[2] + a[3] * b[1] + a[4] * b[0];
+    F c5 = a[1] * b[4] + a[2] * b[3] + a[3] * b[2] + a[4] * b[1];
+    F c6 = a[2] * b[4] + a[3] * b[3] + a[4] * b[2];
+    F c7 = a[3] * b[4] + a[4] * b[3];
+    F c8 = a[4] * b[4];
+    // X^5 = 1 - X^2, X^6 = X - X^3, X^7 = X^2 - X^4, X^8 = X^3 + X^2 - 1.
+    F c5_minus_c8 = c5 - c8;
+    out[0] = c0 + c5_minus_c8;
+    out[1] = c1 + c6;
+    out[2] = c2 - c5_minus_c8 + c7;
+    out[3] = c3 - c6 + c8;
+    out[4] = c4 - c7;
   }
 
 } // namespace pico_gpu

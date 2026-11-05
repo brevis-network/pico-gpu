@@ -91,10 +91,10 @@ __global__ void split_ext_to_base_col_major_matrix_kernel(
     uint32_t n_ext_cols = (total_len / rows);
     for (uint32_t c = 0; c < n_ext_cols; c++) {
         FpExt x = ext_cols[c * rows + r];
-        base_cols[(c * 4 + 0) * rows + r] = x.elems[0];
-        base_cols[(c * 4 + 1) * rows + r] = x.elems[1];
-        base_cols[(c * 4 + 2) * rows + r] = x.elems[2];
-        base_cols[(c * 4 + 3) * rows + r] = x.elems[3];
+#pragma unroll
+        for (uint32_t k = 0; k < FpExt::D; k++) {
+            base_cols[(c * FpExt::D + k) * rows + r] = x.elems[k];
+        }
     }
 }
 

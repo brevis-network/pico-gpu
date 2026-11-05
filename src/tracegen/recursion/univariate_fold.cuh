@@ -10,6 +10,7 @@
 #include "common/rusterror.h"
 #include "tracegen/common/types.cuh"
 #include "tracegen/common/utils.cuh"
+#include "tracegen/recursion/recursion_ef.cuh"
 
 namespace pico_gpu::univariate_fold {
 
@@ -17,29 +18,7 @@ namespace pico_gpu::univariate_fold {
   // (namespace `pico_gpu`); resolved here via enclosing-namespace lookup.
   static constexpr size_t UNIVARIATE_FOLD_OMEGA_ORDER = 16; // (MAX_COEFFS + 1) / 2
 
-  // ── extension-field helpers (degree-4 binomial extension, X^4 - W) ──────────
-
-  template <class F>
-  __device__ __forceinline__ void
-  ef4_mul(const F* a, const F* b, F* out, const F& w)
-  {
-    F a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
-    F b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
-    out[0] = a0 * b0 + w * (a1 * b3 + a2 * b2 + a3 * b1);
-    out[1] = a0 * b1 + a1 * b0 + w * (a2 * b3 + a3 * b2);
-    out[2] = a0 * b2 + a1 * b1 + a2 * b0 + w * (a3 * b3);
-    out[3] = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0;
-  }
-
-  template <class F>
-  __device__ __forceinline__ void
-  ef4_add(const F* a, const F* b, F* out)
-  {
-    out[0] = a[0] + b[0];
-    out[1] = a[1] + b[1];
-    out[2] = a[2] + b[2];
-    out[3] = a[3] + b[3];
-  }
+  // ef_mul lives in recursion_ef.cuh (namespace `pico_gpu`).
 
   // ── kernels ────────────────────────────────────────────────────────────────
 
@@ -66,14 +45,12 @@ namespace pico_gpu::univariate_fold {
   }
 
   /// One thread per event — the Horner recurrence is sequential within each row.
-  /// `w` is the binomial extension constant of the field.
   template <class F>
   __global__ void
   univariate_fold_events_to_trace_kernel(const UnivariateFoldFlatEvent<F>* events,
                                           size_t count,
                                           F* trace_matrix,
-                                          size_t num_cols,
-                                          F w)
+                                          size_t num_cols)
   {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
@@ -98,13 +75,10 @@ namespace pico_gpu::univariate_fold {
     // acc[MAX-2] * r + coeffs[0] = p(r) = next_sum is enforced by the AIR, not stored here.
     row->acc[0] = ev.coeffs[UNIVARIATE_FOLD_MAX_COEFFS - 1];
     for (size_t i = 1; i < UNIVARIATE_FOLD_MAX_COEFFS - 1; ++i) {
-      F prod[4], sum[4];
-      ef4_mul(row->acc[i - 1]._0, ev.r._0, prod, w);
-      ef4_add(prod, ev.coeffs[UNIVARIATE_FOLD_MAX_COEFFS - 1 - i]._0, sum);
-      row->acc[i]._0[0] = sum[0];
-      row->acc[i]._0[1] = sum[1];
-      row->acc[i]._0[2] = sum[2];
-      row->acc[i]._0[3] = sum[3];
+      F prod[EXTENSION_DEGREE];
+      ef_mul(row->acc[i - 1]._0, ev.r._0, prod);
+      for (size_t k = 0; k < EXTENSION_DEGREE; ++k)
+        row->acc[i]._0[k] = prod[k] + ev.coeffs[UNIVARIATE_FOLD_MAX_COEFFS - 1 - i]._0[k];
     }
   }
 
@@ -129,14 +103,12 @@ namespace pico_gpu::univariate_fold {
     return RustError{cudaSuccess};
   }
 
-  /// `w` is the binomial extension constant for the field.
   template <class F>
   inline RustError
   generate_main(const UnivariateFoldFlatEvent<F>* events,
                 size_t num_events,
                 F* trace,
                 size_t num_cols,
-                F w,
                 cudaStream_t stream)
   {
     try {
@@ -144,7 +116,7 @@ namespace pico_gpu::univariate_fold {
       const int block_size = 256;
       int grid_size = (num_events + block_size - 1) / block_size;
       univariate_fold_events_to_trace_kernel<<<grid_size, block_size, 0, stream>>>(
-          events, num_events, trace, num_cols, w);
+          events, num_events, trace, num_cols);
       CUDA_OK(cudaGetLastError());
     } catch (const cuda_error& e) { return RustError{e.code()}; }
     return RustError{cudaSuccess};

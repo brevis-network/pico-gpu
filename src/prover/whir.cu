@@ -84,7 +84,7 @@ __global__ void whir_algebraic_batch_traces_kernel(
         }
     }
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < FpExt::D; i++) {
         dst[i * total_rows + out_row] = acc.elems[i];
     }
 }

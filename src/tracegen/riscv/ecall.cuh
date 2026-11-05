@@ -180,6 +180,12 @@ namespace pico_gpu::ecall_u64 {
         cols.commit_digest_bytes._0[i] = F::from_canonical_u8(digest_bytes[i]);
       }
       cols.commit_mul = F::one();
+      // This row's own share of the commit tally (see the COMMIT_DEFERRED_PROOFS branch below).
+      const uint32_t digest_idx = static_cast<uint32_t>(op_b_value & 0xFFFFFFFF);
+      cols.commits = F::one();
+      cols.commit_mask = digest_idx < PV_DIGEST_NUM_WORDS
+                           ? F::from_canonical_u32(1u << (8 + digest_idx))
+                           : F::zero();
       if (byte_trace != nullptr) {
         byte::add_u8_range_check<F>(byte_trace, digest_bytes[0], digest_bytes[1]);
         byte::add_u8_range_check<F>(byte_trace, digest_bytes[2], digest_bytes[3]);
@@ -200,12 +206,12 @@ namespace pico_gpu::ecall_u64 {
     if (syscall_id_byte ==
         static_cast<uint8_t>(static_cast<uint32_t>(SyscallCode::COMMIT_DEFERRED_PROOFS))) {
       // This row's own share of the tally; the tally scan turns the two into running sums.
-      // The mask share is the index bitmap's weight, so an out-of-range word index adds 0,
-      // matching the host trace.
+      // The mask share is the index bitmap's weight (shifted up by 8 on a COMMIT row), so an
+      // out-of-range word index adds 0, matching the host trace.
       const uint32_t digest_idx = static_cast<uint32_t>(op_b_value & 0xFFFFFFFF);
       cols.deferred_commit_mul = F::one();
-      cols.deferred_commits = F::one();
-      cols.deferred_commit_mask =
+      cols.commits = F::one();
+      cols.commit_mask =
         digest_idx < PV_DIGEST_NUM_WORDS ? F::from_canonical_u32(1u << digest_idx) : F::zero();
       write_word_from_u64<F>(cols.ecall.operand_to_check, op_c_value);
       field_word_range_checker::populate<F>(
@@ -216,21 +222,21 @@ namespace pico_gpu::ecall_u64 {
     cols.is_real = F::one();
   }
 
-  /// The COMMIT_DEFERRED_PROOFS tally of one row: (count, mask).
+  /// The COMMIT / COMMIT_DEFERRED_PROOFS tally of one row: (count, mask).
   template <class F>
-  struct DeferredTally {
+  struct CommitTally {
     F count;
     F mask;
   };
 
   template <class F>
-  struct DeferredTallyAdd {
-    __device__ __forceinline__ DeferredTally<F>
-    operator()(const DeferredTally<F>& a, const DeferredTally<F>& b) const
+  struct CommitTallyAdd {
+    __device__ __forceinline__ CommitTally<F>
+    operator()(const CommitTally<F>& a, const CommitTally<F>& b) const
     {
-      return DeferredTally<F>{a.count + b.count, a.mask + b.mask};
+      return CommitTally<F>{a.count + b.count, a.mask + b.mask};
     }
   };
 
-  constexpr int DEFERRED_TALLY_BLOCK = 256;
+  constexpr int COMMIT_TALLY_BLOCK = 256;
 } // namespace pico_gpu::ecall_u64

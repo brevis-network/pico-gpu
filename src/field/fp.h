@@ -5,11 +5,11 @@
 /*
  * KoalaBear field override for GPU proving kernels.
  *
- * Included as "field/fp.h", so that Fp = kb31_t and FpExt = kb31_4_t for all
- * kernel code. This file directly defines Fp and FpExt wrapping kb31_t/kb31_4_t.
+ * Included as "field/fp.h", so that Fp = kb31_t for all kernel code (FpExt, over
+ * kb31_5_t, is in field/fpext.h). This file directly defines Fp wrapping kb31_t.
  *
  * KoalaBear prime: p = 2^31 - 2^24 + 1 = 0x7F000001
- * Extension field: KoalaBear[x] / (x^4 - 3)  (W = 3 is a non-residue)
+ * Extension field: KoalaBear[x] / (x^5 + x^2 - 1), see field/fpext.h
  */
 
 #pragma once
@@ -17,7 +17,6 @@
 #include <cassert>
 #include <cstdint>
 #include "ff/koala_bear.hpp"
-#include "ff/koala_bear_ext.hpp"
 
 // ---------------------------------------------------------------------------
 // Fp = kb31_t wrapper

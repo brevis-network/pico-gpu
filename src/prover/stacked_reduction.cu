@@ -152,7 +152,7 @@ __global__ void r0_partial_sums_kernel(
             uint32_t *eq_words = reinterpret_cast<uint32_t *>(&eq_x);
             uint32_t *rot_words = reinterpret_cast<uint32_t *>(&rot_delta);
 #pragma unroll
-            for (int w = 0; w < 4; w++) {
+            for (int w = 0; w < FpExt::D; w++) {
                 eq_words[w] = __shfl_sync(0xffffffffu, eq_words[w], leader);
                 rot_words[w] = __shfl_sync(0xffffffffu, rot_words[w], leader);
             }
@@ -307,7 +307,7 @@ __global__ void mle_round_window_kernel(
     const FpExt *__restrict__ k_rot_segments, // k_rot segments base
     const UnstackedSlice *__restrict__ slices, // window of unstacked columns
     const FpExt *__restrict__ coeffs,          // lambda powers for the same window
-    uint64_t *__restrict__ acc_out, // S_DEG x 4 u64 limbs, summed atomically, finished on the CPU
+    uint64_t *__restrict__ acc_out, // S_DEG x FpExt::D u64 limbs, summed atomically, finished on the CPU
     uint32_t q_rows,
     uint32_t n_slices,
     uint32_t y_count
@@ -367,7 +367,7 @@ __global__ void mle_round_window_kernel(
     for (int d = 0; d < S_DEG; d++) {
         FpExt blk_total = reduce::block_reduce_sum(partial[d], warp_buf);
         if (threadIdx.x == 0) {
-            reduce::atomic_add_fpext_to_u64(acc_out + d * 4, blk_total);
+            reduce::atomic_add_fpext_to_u64(acc_out + d * FpExt::D, blk_total);
         }
         __syncthreads();
     }
@@ -384,7 +384,7 @@ __global__ void mle_round_tail_kernel(
     FpExt rot_low,                      // k_rot factor shared by every slice
     const UnstackedSlice *__restrict__ slices, // window of unstacked columns
     const FpExt *__restrict__ coeffs,          // lambda powers for the same window
-    uint64_t *__restrict__ acc_out, // S_DEG x 4 u64 limbs, summed atomically, finished on the CPU
+    uint64_t *__restrict__ acc_out, // S_DEG x FpExt::D u64 limbs, summed atomically, finished on the CPU
     uint32_t q_rows,
     uint32_t n_slices,
     uint32_t shift // l_skip + round index
@@ -434,7 +434,7 @@ __global__ void mle_round_tail_kernel(
     for (int d = 0; d < S_DEG; d++) {
         FpExt blk_total = reduce::block_reduce_sum(partial[d], warp_buf);
         if (threadIdx.x == 0) {
-            reduce::atomic_add_fpext_to_u64(acc_out + d * 4, blk_total);
+            reduce::atomic_add_fpext_to_u64(acc_out + d * FpExt::D, blk_total);
         }
         __syncthreads();
     }
@@ -634,7 +634,7 @@ extern "C" int _kb_stacked_reduction_sumcheck_mle_round_degenerate(
     FpExt rot_low,
     const UnstackedSlice *slices,
     const FpExt *coeffs,
-    uint64_t *acc_out, // S_DEG x 4 u64 limbs, summed atomically, finished on the CPU
+    uint64_t *acc_out, // S_DEG x FpExt::D u64 limbs, summed atomically, finished on the CPU
     uint32_t q_rows,
     uint32_t n_slices,
     uint32_t log_skip,

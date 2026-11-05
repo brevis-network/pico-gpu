@@ -10,9 +10,9 @@
 // The ecall trace is compared in order: its rows are the ecall list's, in list order, which is
 // execution order. Each row is built by the chip's event_to_row from the event the loaders rebuild,
 // the builder that made the chip's rows before the history, so a row and its byte lookups are
-// unchanged for the same event. Its COMMIT_DEFERRED_PROOFS tally columns are running sums down the
-// trace, padding included, so the last row carries the chunk's; the scan stops at the list's length
-// as the device reads it, and the rows past it take the last list row's sums.
+// unchanged for the same event. Its COMMIT / COMMIT_DEFERRED_PROOFS tally columns are running sums
+// down the trace, padding included, so the last row carries the chunk's; the scan stops at the
+// list's length as the device reads it, and the rows past it take the last list row's sums.
 //
 // The syscall trace is a multiset of rows, but each row also writes one global-bus event at its own
 // index past the host's start index, and the global trace is in order: the history's syscall rows
@@ -152,39 +152,39 @@ namespace pico_gpu::ecall_history {
   // no scratch memory. The row count is read on the device, the same in every thread, so every
   // thread reaches the scan's barriers.
   template <class F>
-  __global__ void deferred_tally_scan_kernel(
+  __global__ void commit_tally_scan_kernel(
     const history::HistoryArgs args, const size_t rows, F* trace, const size_t num_cols)
   {
-    using Tally = ecall_u64::DeferredTally<F>;
-    typedef cub::BlockScan<Tally, ecall_u64::DEFERRED_TALLY_BLOCK> BlockScan;
+    using Tally = ecall_u64::CommitTally<F>;
+    typedef cub::BlockScan<Tally, ecall_u64::COMMIT_TALLY_BLOCK> BlockScan;
     __shared__ typename BlockScan::TempStorage temp_storage;
     __shared__ Tally carry;
     const size_t count = ecall_syscall_history::ecall_rows(args, rows);
     if (threadIdx.x == 0) carry = Tally{F::zero(), F::zero()};
     __syncthreads();
 
-    for (size_t base = 0; base < count; base += ecall_u64::DEFERRED_TALLY_BLOCK) {
+    for (size_t base = 0; base < count; base += ecall_u64::COMMIT_TALLY_BLOCK) {
       const size_t row = base + threadIdx.x;
       EcallChipColsU64<F>* cols = reinterpret_cast<EcallChipColsU64<F>*>(&trace[row * num_cols]);
       Tally own{F::zero(), F::zero()};
-      if (row < count) own = Tally{cols->deferred_commits, cols->deferred_commit_mask};
+      if (row < count) own = Tally{cols->commits, cols->commit_mask};
       Tally prefix;
       Tally tile_total;
-      BlockScan(temp_storage).InclusiveScan(own, prefix, ecall_u64::DeferredTallyAdd<F>(), tile_total);
+      BlockScan(temp_storage).InclusiveScan(own, prefix, ecall_u64::CommitTallyAdd<F>(), tile_total);
       const Tally before = carry;
       if (row < count) {
-        cols->deferred_commits = before.count + prefix.count;
-        cols->deferred_commit_mask = before.mask + prefix.mask;
+        cols->commits = before.count + prefix.count;
+        cols->commit_mask = before.mask + prefix.mask;
       }
       __syncthreads();
-      if (threadIdx.x == 0) carry = ecall_u64::DeferredTallyAdd<F>()(before, tile_total);
+      if (threadIdx.x == 0) carry = ecall_u64::CommitTallyAdd<F>()(before, tile_total);
       __syncthreads();
     }
   }
 
   // The rows past the list take the last list row's sums; with no list row they stay zero.
   template <class F>
-  __global__ void deferred_tally_fill_kernel(
+  __global__ void commit_tally_fill_kernel(
     const history::HistoryArgs args, const size_t rows, F* trace, const size_t num_cols)
   {
     const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -193,8 +193,8 @@ namespace pico_gpu::ecall_history {
     if (count == 0 || row < count) return;
     const EcallChipColsU64<F>* last = reinterpret_cast<const EcallChipColsU64<F>*>(&trace[(count - 1) * num_cols]);
     EcallChipColsU64<F>* cols = reinterpret_cast<EcallChipColsU64<F>*>(&trace[row * num_cols]);
-    cols->deferred_commits = last->deferred_commits;
-    cols->deferred_commit_mask = last->deferred_commit_mask;
+    cols->commits = last->commits;
+    cols->commit_mask = last->commit_mask;
   }
 
   template <class F>
@@ -219,10 +219,10 @@ namespace pico_gpu::ecall_history {
       ecall_history_to_trace_kernel<F>
         <<<grid, ecall_syscall_history::BLOCK_SIZE, 0, stream>>>(args, rows, trace, num_cols, byte_trace);
       CUDA_OK(cudaGetLastError());
-      deferred_tally_scan_kernel<F>
-        <<<1, ecall_u64::DEFERRED_TALLY_BLOCK, 0, stream>>>(args, rows, trace, num_cols);
+      commit_tally_scan_kernel<F>
+        <<<1, ecall_u64::COMMIT_TALLY_BLOCK, 0, stream>>>(args, rows, trace, num_cols);
       CUDA_OK(cudaGetLastError());
-      deferred_tally_fill_kernel<F>
+      commit_tally_fill_kernel<F>
         <<<grid, ecall_syscall_history::BLOCK_SIZE, 0, stream>>>(args, rows, trace, num_cols);
       CUDA_OK(cudaGetLastError());
     } catch (const cuda_error& e) {

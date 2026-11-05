@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // UnpackBlockChip GPU trace generation.
-// Unpacks an extension-field Block into its four base-field lanes.
+// Unpacks an extension-field Block into its EXTENSION_DEGREE base-field lanes.
 
 #pragma once
 
@@ -28,7 +28,7 @@ namespace pico_gpu::unpack_block {
         reinterpret_cast<UnpackBlockPreprocessedCols<F>*>(&trace_matrix[idx * num_cols]);
     row->is_real = F::one();
     row->in_addr = instrs[idx].in_addr;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < EXTENSION_DEGREE; ++i) {
       row->out[i].addr = instrs[idx].out_addrs[i];
       row->out[i].mult = instrs[idx].mults[i];
     }

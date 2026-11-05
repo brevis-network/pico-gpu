@@ -65,7 +65,7 @@ __global__ void eval_poly_ext_partial_kernel(
             const size_t idx = t + (k - 1) * stride;
             FpExt c;
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < FpExt::D; i++) {
                 c.elems[i] = coeffs[i * len + idx];
             }
             acc = acc * y + c;
@@ -165,7 +165,7 @@ __global__ void transpose_fp_to_fpext_vec_kernel(
         return;
 
 #pragma unroll
-    for (int limb = 0; limb < 4; limb++) {
+    for (int limb = 0; limb < FpExt::D; limb++) {
         dst[j].elems[limb] = src[limb * n + j];
     }
 }

@@ -6,8 +6,11 @@
 #include <cstdint>
 
 namespace pico_gpu {
-  /// Extension degree
-  constexpr static const size_t EXTENSION_DEGREE = 4;
+  /// Extension degree: the recursion circuit's KoalaBear^5 (X^5 + X^2 - 1).
+  constexpr static const size_t EXTENSION_DEGREE = 5;
+  /// Lanes of a packed Block (digests, permutation states, opened rows); its other lanes are
+  /// the constant zero on the memory bus. Mirrors Rust `PACK_LANES`.
+  constexpr static const size_t PACK_LANES = 4;
   constexpr static const size_t BASE_ALU_DATAPAR = 2;
   constexpr static const size_t EXT_ALU_DATAPAR = 4;
   /// Bit width of the Ecall chip's BitRange cap on num_extra_clk; mirrors Rust
@@ -741,11 +744,13 @@ namespace pico_gpu {
     /// is_real x is_commit: the multiplicity of the digest-byte range check, materialized
     /// because an interaction count must be affine in current-row columns too.
     T commit_mul;
-    /// is_real x is_commit_deferred_proofs, and the running count and sum of 2^word_index of
-    /// such rows up to this one. The last row's pair is the chunk's published tally.
+    /// is_real x is_commit_deferred_proofs.
     T deferred_commit_mul;
-    T deferred_commits;
-    T deferred_commit_mask;
+    /// The running count and mask of the COMMIT and COMMIT_DEFERRED_PROOFS rows up to this one,
+    /// each adding 2^(8 + word_index) (COMMIT) or 2^word_index to the mask. The last row's pair
+    /// is the chunk's published tally.
+    T commits;
+    T commit_mask;
     /// The syscall-decode machinery.
     EcallColsU64<T> ecall;
     /// Whether this row is an actual ecall (multiplicity of the looked message).
@@ -1181,11 +1186,14 @@ namespace pico_gpu {
     T is_real;
     T is_receive;
     T is_send;
+    /// 16 + 9 limb decomposition of message[1]; mirrors Rust.
+    T message_1_16bit_limb;
+    T message_1_hi9;
     GlobalAccumulationOperation<T, 1> accumulation;
   };
-  // Column budget the riscv_global TPC kernels hardcode (33 fixed + 7 lambda + 14 cum). The field
-  // type is a 4-byte word, so the u32 instantiation has the same layout.
-  static_assert(sizeof(GlobalCols<uint32_t>) == 54 * sizeof(uint32_t), "GlobalCols must be 54 columns");
+  // Column budget the riscv_global TPC kernels hardcode (35 fixed incl. the 2 message[1] limbs +
+  // 7 lambda + 14 cum). The field type is a 4-byte word, so the u32 instantiation has the same layout.
+  static_assert(sizeof(GlobalCols<uint32_t>) == 56 * sizeof(uint32_t), "GlobalCols must be 56 columns");
 
   template <typename T>
   struct BytePreprocessedCols {
@@ -1638,7 +1646,7 @@ namespace pico_gpu {
 
   // ── Recursion pure-copy chips (layouts byte-compatible with the Rust #[repr(C)] columns) ──
 
-  // UnpackBlock: unpacks a Block into 4 base-field lanes written to memory.
+  // UnpackBlock: unpacks a Block into its EXTENSION_DEGREE base-field lanes written to memory.
   /// Event: the Block value being unpacked.
   template <typename F>
   struct UnpackBlockEvent {
@@ -1648,15 +1656,15 @@ namespace pico_gpu {
   template <typename F>
   struct UnpackBlockInstr {
     Address<F> in_addr;
-    Address<F> out_addrs[4];
-    F mults[4];
+    Address<F> out_addrs[EXTENSION_DEGREE];
+    F mults[EXTENSION_DEGREE];
   };
   /// Preprocessed trace columns.
   template <typename F>
   struct UnpackBlockPreprocessedCols {
     F is_real;
     Address<F> in_addr;
-    RecursionMemoryAccessCols<F> out[4];
+    RecursionMemoryAccessCols<F> out[EXTENSION_DEGREE];
   };
   /// Main trace columns: the unpacked Block value.
   template <typename F>
@@ -1793,18 +1801,19 @@ namespace pico_gpu {
   // is data-dependent and unbounded) and copied into the device trace verbatim.
   constexpr static const size_t EXT_DOT_PRODUCT_DATAPAR = 8;
   constexpr static const size_t EXT_DOT_PRODUCT_GROUPS = 2;
-  /// Main event: mus[DATAPAR] blocks, vals[GROUPS] packed blocks, running acc.
+  /// Main event: mus[DATAPAR] blocks, the PACK_LANES value lanes of each of the GROUPS packed
+  /// blocks, running acc.
   template <typename F>
   struct ExtDotProductEvent {
     Block<F> mus[EXT_DOT_PRODUCT_DATAPAR];
-    Block<F> vals[EXT_DOT_PRODUCT_GROUPS];
+    F vals[EXT_DOT_PRODUCT_GROUPS][PACK_LANES];
     Block<F> acc;
   };
   /// Main columns: identical layout to the event.
   template <typename F>
   struct ExtDotProductCols {
     Block<F> mus[EXT_DOT_PRODUCT_DATAPAR];
-    Block<F> vals[EXT_DOT_PRODUCT_GROUPS];
+    F vals[EXT_DOT_PRODUCT_GROUPS][PACK_LANES];
     Block<F> acc;
   };
   /// Preprocessed columns: per-row element addresses + segment bookkeeping.

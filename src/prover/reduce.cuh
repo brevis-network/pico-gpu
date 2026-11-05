@@ -102,10 +102,10 @@ static __device__ inline FpExt warp_reduce_sum(FpExt val REDUCE_CALLER_LOC_PARAM
     for (int offset = 16; offset > 0; offset /= 2) {
         // The shuffles stay outside the guard: every thread of the mask must execute each one.
         FpExt other;
-        other.elems[0] = Fp::fromRaw(__shfl_down_sync(mask, val.elems[0].asRaw(), offset));
-        other.elems[1] = Fp::fromRaw(__shfl_down_sync(mask, val.elems[1].asRaw(), offset));
-        other.elems[2] = Fp::fromRaw(__shfl_down_sync(mask, val.elems[2].asRaw(), offset));
-        other.elems[3] = Fp::fromRaw(__shfl_down_sync(mask, val.elems[3].asRaw(), offset));
+#pragma unroll
+        for (int i = 0; i < FpExt::D; i++) {
+            other.elems[i] = Fp::fromRaw(__shfl_down_sync(mask, val.elems[i].asRaw(), offset));
+        }
         if (lane + offset < live) {
             val = val + other;
         }
@@ -123,7 +123,7 @@ __device__ __forceinline__ FpExt warp_reduce_sum_n(FpExt val, uint32_t n) {
     for (uint32_t offset = n >> 1; offset > 0; offset >>= 1) {
         FpExt other;
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < FpExt::D; i++) {
             other.elems[i] = Fp::fromRaw(__shfl_xor_sync(mask, val.elems[i].asRaw(), offset));
         }
         val = val + other;
@@ -165,7 +165,7 @@ __device__ inline FpExt chunk_reduce_sum(
 
     // (3) the chunk's leading warp folds those partials
     if (warp_rank == 0) {
-        FpExt zero_ext = {0, 0, 0, 0};
+        FpExt zero_ext = FpExt(Fp::zero());
         FpExt partial = (lane < chunk_warps) ? chunk_partials[lane] : zero_ext;
         acc = warp_reduce_sum(partial REDUCE_CALLER_LOC_ARGS);
     }
@@ -186,10 +186,10 @@ __device__ __forceinline__ void atomic_add_fp_to_u64(uint64_t *acc_u64, Fp x) {
     atomicAdd((unsigned long long *)acc_u64, static_cast<uint64_t>(x.asRaw()));
 }
 
-// Same for an extension element: limb k of `x` goes into acc_u64[k], k = 0..3.
+// Same for an extension element: limb k of `x` goes into acc_u64[k], k = 0..FpExt::D-1.
 __device__ __forceinline__ void atomic_add_fpext_to_u64(uint64_t *acc_u64, FpExt x) {
 #pragma unroll
-    for (int limb = 0; limb < 4; ++limb) {
+    for (int limb = 0; limb < FpExt::D; ++limb) {
         atomic_add_fp_to_u64(acc_u64 + limb, x.elems[limb]);
     }
 }
@@ -217,7 +217,7 @@ static __device__ inline FpExt block_reduce_sum(
     __syncthreads();
 
     // Stage 2: warp 0 folds the partials, lane k picking up warp k's slot.
-    FpExt zero_ext = {0, 0, 0, 0};
+    FpExt zero_ext = FpExt(Fp::zero());
     if (warp_no == 0) {
         FpExt partial = (lane < warp_count) ? shared[lane] : zero_ext;
         acc = warp_reduce_sum(partial REDUCE_CALLER_LOC_ARGS);
@@ -246,7 +246,7 @@ static __global__ void static_final_reduce_block_sums(
     if (col >= D)
         return;
 
-    FpExt total = {0, 0, 0, 0};
+    FpExt total = FpExt(Fp::zero());
 
     // Block-stride walk over the partial rows.
     for (int row = t; row < n_partials; row += blockDim.x) {
@@ -278,7 +278,7 @@ static __global__ void final_reduce_block_sums(
     int col = blockIdx.x;
     int n_cols = gridDim.x;
 
-    FpExt total = {0, 0, 0, 0};
+    FpExt total = FpExt(Fp::zero());
 
     // Block-stride walk over the partial rows.
     for (int row = t; row < n_partials; row += blockDim.x) {
@@ -318,7 +318,7 @@ static __global__ void batched_final_reduce_block_sums(
     uint32_t row_end = segment_offsets[seg + 1];
     uint32_t seg_rows = row_end - row_begin;
 
-    FpExt total = {0, 0, 0, 0};
+    FpExt total = FpExt(Fp::zero());
 
     // Block-stride walk over this segment's rows.
     for (uint32_t r = t; r < seg_rows; r += blockDim.x) {

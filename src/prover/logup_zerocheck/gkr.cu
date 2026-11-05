@@ -28,18 +28,131 @@ constexpr int ROUND_EVALS = 2;
 // ----------------------------------------------------------------------------
 // Device side
 // ----------------------------------------------------------------------------
-template <bool undo, bool with_alpha = false>
+
+// FpExt is 20 packed bytes (FracExt 40), 4-byte aligned: an element at an odd index is not
+// 8- or 16-byte aligned, so it moves as plain 32-bit words. Packed 20-byte loads still run at
+// full DRAM bandwidth (a fold measured at 1539 GB/s, the same as aligned 16-byte loads).
+__device__ __forceinline__ FpExt ext_load(const FpExt *in_ptr) { return *in_ptr; }
+__device__ __forceinline__ void ext_store(FpExt *out_ptr, FpExt val) { *out_ptr = val; }
+__device__ __forceinline__ FracExt frac_load(const FracExt *in_ptr) { return *in_ptr; }
+__device__ __forceinline__ void frac_store(FracExt *out_ptr, FracExt val) { *out_ptr = val; }
+
+// ----------------------------------------------------------------------------
+// Virtual input padding
+// ----------------------------------------------------------------------------
+// The leaf count is padded to a power of two, logical_len = L, but only the first real_len = R
+// leaves are real (L/2 <= R <= L); the rest are (0, den_shift) once the denominators are shifted.
+// A virtual buffer holds R entries instead of L. A node of the active layer (`active` entries,
+// each covering L / active leaves) whose leaves are all padding is never stored: its value is
+// (0, den_shift^(L / active)), recomputed on read. A stored node at dense position pos < R sits in
+// its own slot; only leaf-level right siblings can have pos >= R, and they sit in the slot of
+// their natural (non-reversed) leaf index, which is a padding-only hole of the layout.
+// After openvm-org/stark-backend#331 (MIT/Apache-2.0). Every in-place pass over a virtual buffer
+// must only overwrite slots no other thread still reads; each kernel below states why it does.
+__device__ __forceinline__ uint32_t log2_pow2(uint32_t x) { return 31u - __clz(x); }
+
+// pad_dens[k] = den_shift^(2^k), k < 32: the denominator of an all-padding subtree of 2^k leaves,
+// read from a table the host fills once per proof (squaring den_shift on every padding read put
+// up to 30 extension multiplications into bandwidth-bound kernels).
+__device__ __forceinline__ FracExt virt_load(
+    const FracExt *nodes,
+    uint32_t pos,
+    uint32_t active,
+    uint32_t real_len,
+    uint32_t logical_len,
+    const FpExt *__restrict__ pad_dens
+) {
+    uint32_t subtree_len = logical_len / active;
+    uint32_t first_leaf = rev_len(pos, log2_pow2(active)) * subtree_len;
+    if (first_leaf >= real_len) {
+        return {FpExt(Fp::zero()), pad_dens[log2_pow2(subtree_len)]};
+    }
+    return frac_load(nodes + (pos < real_len ? pos : first_leaf));
+}
+
+// Stores a node of the active layer; all-padding nodes are dropped.
+__device__ __forceinline__ void virt_store(
+    FracExt *nodes,
+    uint32_t pos,
+    uint32_t active,
+    uint32_t real_len,
+    uint32_t logical_len,
+    FracExt val
+) {
+    uint32_t subtree_len = logical_len / active;
+    uint32_t first_leaf = rev_len(pos, log2_pow2(active)) * subtree_len;
+    if (first_leaf >= real_len) {
+        return;
+    }
+    frac_store(nodes + (pos < real_len ? pos : first_leaf), val);
+}
+
+// The real/logical lengths of a virtual buffer and its padding table, passed to the kernels by
+// value.
+struct VirtLens {
+    uint32_t real_len;
+    uint32_t logical_len;
+    const FpExt *pad_dens;
+};
+
+// Loads entry pos of a buffer whose active layer has `active` entries: plain in a dense instance,
+// through virt_load in a virtual one.
+template <bool VIRT>
+__device__ __forceinline__ FracExt node_load(
+    const FracExt *nodes,
+    uint32_t pos,
+    uint32_t active,
+    VirtLens const &vl
+) {
+    if constexpr (VIRT) {
+        return virt_load(nodes, pos, active, vl.real_len, vl.logical_len, vl.pad_dens);
+    } else {
+        return frac_load(nodes + pos);
+    }
+}
+
+template <bool VIRT>
+__device__ __forceinline__ void node_store(
+    FracExt *nodes,
+    uint32_t pos,
+    uint32_t active,
+    VirtLens const &vl,
+    FracExt val
+) {
+    if constexpr (VIRT) {
+        virt_store(nodes, pos, active, vl.real_len, vl.logical_len, val);
+    } else {
+        frac_store(nodes + pos, val);
+    }
+}
+
+template <bool undo, bool with_alpha = false, bool VIRT = false>
 __global__ void frac_build_tree_layer_kernel(
     FracExt *__restrict__ nodes,
     uint32_t h_off,
-    FpExt den_shift = FpExt(Fp(0))
+    FpExt den_shift,
+    VirtLens vl
 ) {
     uint32_t pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos >= h_off) {
         return;
     }
 
-    if constexpr (with_alpha) {
+    if constexpr (VIRT) {
+        // Internal layers only (the host densifies inputs that need the alpha-shifting leaf
+        // pass). Merging reads the layer below (2 * h_off entries) and stores into the layer
+        // above; undoing reads the parent from the layer above and stores the left child below.
+        static_assert(!with_alpha, "virtual leaf-level build is not supported");
+        uint32_t below = h_off << 1;
+        FracExt left = node_load<true>(nodes, pos, undo ? h_off : below, vl);
+        FracExt right = node_load<true>(nodes, pos | h_off, below, vl);
+        if constexpr (undo) {
+            frac_unadd_inplace(left, right);
+        } else {
+            frac_add_inplace(left, right);
+        }
+        node_store<true>(nodes, pos, undo ? below : h_off, vl, left);
+    } else if constexpr (with_alpha) {
         // Shift both denominators by den_shift first, then merge the pair through
         // local copies.
         FracExt left_v = nodes[pos];
@@ -67,43 +180,6 @@ __global__ void frac_build_tree_layer_kernel(
     }
 }
 
-// FpExt/FracExt have only 4-byte alignment, so plain struct copies compile to 4/8
-// scalar accesses per element. All elements in these buffers sit at 16/32-byte-aligned
-// offsets, so moving them as uint4 vectors is legal and byte-identical, with 4x fewer
-// memory transactions (same mechanism as the vectorized k2 bit-reversal kernel).
-union ExtVec16 {
-    uint4 v;
-    FpExt f;
-    __device__ ExtVec16() {}
-};
-__device__ __forceinline__ FpExt ext_load16(const FpExt *in_ptr) {
-    ExtVec16 u;
-    u.v = *reinterpret_cast<const uint4 *>(in_ptr);
-    return u.f;
-}
-__device__ __forceinline__ void ext_store16(FpExt *out_ptr, FpExt val) {
-    ExtVec16 u;
-    u.f = val;
-    *reinterpret_cast<uint4 *>(out_ptr) = u.v;
-}
-union FracVec16 {
-    uint4 v[2];
-    FracExt f;
-    __device__ FracVec16() {}
-};
-__device__ __forceinline__ FracExt frac_load16(const FracExt *in_ptr) {
-    FracVec16 u;
-    u.v[0] = reinterpret_cast<const uint4 *>(in_ptr)[0];
-    u.v[1] = reinterpret_cast<const uint4 *>(in_ptr)[1];
-    return u.f;
-}
-__device__ __forceinline__ void frac_store16(FracExt *out_ptr, FracExt val) {
-    FracVec16 u;
-    u.f = val;
-    reinterpret_cast<uint4 *>(out_ptr)[0] = u.v[0];
-    reinterpret_cast<uint4 *>(out_ptr)[1] = u.v[1];
-}
-
 // The eq table is stored as two factors: entry pos equals
 // eq_lo[pos & (2^lo_bits - 1)] * eq_hi[pos >> lo_bits].
 __device__ __forceinline__ FpExt eq_split_lookup(
@@ -112,8 +188,8 @@ __device__ __forceinline__ FpExt eq_split_lookup(
     uint32_t const lo_bits,
     uint32_t const pos
 ) {
-    return ext_load16(eq_lo + (pos & ((1u << lo_bits) - 1))) *
-           ext_load16(eq_hi + (pos >> lo_bits));
+    return ext_load(eq_lo + (pos & ((1u << lo_bits) - 1))) *
+           ext_load(eq_hi + (pos >> lo_bits));
 }
 
 // Add this point's contributions to the running sums for s'(1) and s'(2).
@@ -195,10 +271,10 @@ __global__ void compute_round_block_sum_kernel(
 
         // Loads the four leaves (poly 0/1) x (current variable 0/1); the values at the
         // current variable's 0 and 1 points are extrapolated linearly to X = 1, 2.
-        FracExt const at00 = frac_load16(pq_buf + pos);
-        FracExt const at10 = frac_load16(pq_buf + with_rev_bits(pos, pq_len, 1, 0));
-        FracExt const at01 = frac_load16(pq_buf + with_rev_bits(pos, pq_len, 0, 1));
-        FracExt const at11 = frac_load16(pq_buf + with_rev_bits(pos, pq_len, 1, 1));
+        FracExt const at00 = frac_load(pq_buf + pos);
+        FracExt const at10 = frac_load(pq_buf + with_rev_bits(pos, pq_len, 1, 0));
+        FracExt const at01 = frac_load(pq_buf + with_rev_bits(pos, pq_len, 0, 1));
+        FracExt const at11 = frac_load(pq_buf + with_rev_bits(pos, pq_len, 1, 1));
         auto const &[n0_at0, d0_at0] = at00;
         auto const &[n1_at0, d1_at0] = at10;
         auto const &[n0_at1, d0_at1] = at01;
@@ -252,15 +328,43 @@ __global__ void fold_ef_columns_kernel(const FpExt *in_ptr, FpExt *out_ptr, uint
         return;
     }
 
-    FpExt x0 = ext_load16(in_ptr + pos);
-    FpExt x1 = ext_load16(in_ptr + (pos | q_off));
-    ext_store16(out_ptr + pos, x0 + chal * (x1 - x0));
+    FpExt x0 = ext_load(in_ptr + pos);
+    FpExt x1 = ext_load(in_ptr + (pos | q_off));
+    ext_store(out_ptr + pos, x0 + chal * (x1 - x0));
 
     uint32_t h_off = q_off << 1;
 
-    FpExt x2 = ext_load16(in_ptr + (pos | h_off));
-    FpExt x3 = ext_load16(in_ptr + (pos | h_off | q_off));
-    ext_store16(out_ptr + (pos | q_off), x2 + chal * (x3 - x2));
+    FpExt x2 = ext_load(in_ptr + (pos | h_off));
+    FpExt x3 = ext_load(in_ptr + (pos | h_off | q_off));
+    ext_store(out_ptr + (pos | q_off), x2 + chal * (x3 - x2));
+}
+
+// fold_ef_columns_kernel over a virtual layer of `size` entries, on FracExt entries: thread pos
+// writes out_ptr[pos] = fold(in[pos], in[pos + size/4]) and
+// out_ptr[pos + size/4] = fold(in[pos + size/2], in[pos + 3*size/4]). out_ptr is dense and
+// never aliases in_ptr.
+__global__ void fold_frac_columns_virt_kernel(
+    const FracExt *__restrict__ in_ptr,
+    FracExt *__restrict__ out_ptr,
+    uint32_t size,
+    FpExt chal,
+    VirtLens vl
+) {
+    uint32_t q_off = size >> 2;
+    uint32_t pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= q_off) {
+        return;
+    }
+    uint32_t h_off = q_off << 1;
+
+    FracExt x0 = virt_load(in_ptr, pos, size, vl.real_len, vl.logical_len, vl.pad_dens);
+    FracExt x1 = virt_load(in_ptr, pos + q_off, size, vl.real_len, vl.logical_len, vl.pad_dens);
+    frac_store(out_ptr + pos, {x0.p + chal * (x1.p - x0.p), x0.q + chal * (x1.q - x0.q)});
+
+    FracExt x2 = virt_load(in_ptr, pos + h_off, size, vl.real_len, vl.logical_len, vl.pad_dens);
+    FracExt x3 =
+        virt_load(in_ptr, pos + h_off + q_off, size, vl.real_len, vl.logical_len, vl.pad_dens);
+    frac_store(out_ptr + pos + q_off, {x2.p + chal * (x3.p - x2.p), x2.q + chal * (x3.q - x2.q)});
 }
 
 // One inner sumcheck round with the previous round's fold merged in (separate buffers).
@@ -276,7 +380,10 @@ __global__ void fold_ef_columns_kernel(const FpExt *in_ptr, FpExt *out_ptr, uint
 // Each pair is loaded, folded and stored inside its own small scope so that only the
 // folded scalars stay live.
 //
+// Virtual: pq_in is a virtual layer (2 * pq_len entries); pq_out is always dense.
+//
 // Dynamic shared memory: one FpExt per warp (at least one).
+template <bool VIRT>
 __global__ void compute_round_and_fold_kernel(
     const FpExt *__restrict__ eq_lo,
     const FpExt *__restrict__ eq_hi,
@@ -286,10 +393,12 @@ __global__ void compute_round_and_fold_kernel(
     FpExt lam,
     FpExt fold_r,  // challenge of the previous round
     FpExt *__restrict__ blk_sums,  // [gridDim.x * 2]
-    FracExt *__restrict__ pq_out  // folded, pq_len entries
+    FracExt *__restrict__ pq_out,  // folded, pq_len entries
+    VirtLens vl
 ) {
     extern __shared__ FpExt red_smem[];
     const uint32_t pq_len = 2 * x_count;
+    const uint32_t in_len = pq_len << 1;  // active entries of pq_in
 
     // Offsets of the four leaves; the in-place kernel below derives them.
     const uint32_t h_off = pq_len;  // half of the unfolded length
@@ -311,35 +420,35 @@ __global__ void compute_round_and_fold_kernel(
         // Fold each pair and store it right away.
         // leaf (0,0) -> pos
         {
-            FracExt lo_f = frac_load16(pq_in + pos);
-            FracExt hi_f = frac_load16(pq_in + pos + q_off);
+            FracExt lo_f = node_load<VIRT>(pq_in, pos, in_len, vl);
+            FracExt hi_f = node_load<VIRT>(pq_in, pos + q_off, in_len, vl);
             n0_at0 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d0_at0 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
-            frac_store16(pq_out + pos, {n0_at0, d0_at0});
+            frac_store(pq_out + pos, {n0_at0, d0_at0});
         }
         // leaf (1,0) -> pos + q_off
         {
-            FracExt lo_f = frac_load16(pq_in + pos + h_off);
-            FracExt hi_f = frac_load16(pq_in + pos + h_off + q_off);
+            FracExt lo_f = node_load<VIRT>(pq_in, pos + h_off, in_len, vl);
+            FracExt hi_f = node_load<VIRT>(pq_in, pos + h_off + q_off, in_len, vl);
             n1_at0 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d1_at0 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
-            frac_store16(pq_out + pos + q_off, {n1_at0, d1_at0});
+            frac_store(pq_out + pos + q_off, {n1_at0, d1_at0});
         }
         // leaf (0,1) -> pos + e_off
         {
-            FracExt lo_f = frac_load16(pq_in + pos + e_off);
-            FracExt hi_f = frac_load16(pq_in + pos + e3_off);
+            FracExt lo_f = node_load<VIRT>(pq_in, pos + e_off, in_len, vl);
+            FracExt hi_f = node_load<VIRT>(pq_in, pos + e3_off, in_len, vl);
             n0_at1 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d0_at1 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
-            frac_store16(pq_out + pos + e_off, {n0_at1, d0_at1});
+            frac_store(pq_out + pos + e_off, {n0_at1, d0_at1});
         }
         // leaf (1,1) -> pos + e3_off
         {
-            FracExt lo_f = frac_load16(pq_in + pos + h_off + e_off);
-            FracExt hi_f = frac_load16(pq_in + pos + h_off + e3_off);
+            FracExt lo_f = node_load<VIRT>(pq_in, pos + h_off + e_off, in_len, vl);
+            FracExt hi_f = node_load<VIRT>(pq_in, pos + h_off + e3_off, in_len, vl);
             n1_at1 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d1_at1 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
-            frac_store16(pq_out + pos + e3_off, {n1_at1, d1_at1});
+            frac_store(pq_out + pos + e3_off, {n1_at1, d1_at1});
         }
 
         accum_round_terms(
@@ -405,41 +514,159 @@ __global__ void compute_round_and_fold_inplace_kernel(
 
         // leaf (0,0): slots pos, pos + q_off
         {
-            FracExt lo_f = frac_load16(pq + pos);
-            FracExt hi_f = frac_load16(pq + pos + q_off);
+            FracExt lo_f = frac_load(pq + pos);
+            FracExt hi_f = frac_load(pq + pos + q_off);
             n0_at0 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d0_at0 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
         }
 
         // leaf (1,0): slots pos + h_off, pos + h_off + q_off
         {
-            FracExt lo_f = frac_load16(pq + pos + h_off);
-            FracExt hi_f = frac_load16(pq + pos + h_off + q_off);
+            FracExt lo_f = frac_load(pq + pos + h_off);
+            FracExt hi_f = frac_load(pq + pos + h_off + q_off);
             n1_at0 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d1_at0 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
         }
 
         // leaf (0,1): slots pos + e_off, pos + e3_off
         {
-            FracExt lo_f = frac_load16(pq + pos + e_off);
-            FracExt hi_f = frac_load16(pq + pos + e3_off);
+            FracExt lo_f = frac_load(pq + pos + e_off);
+            FracExt hi_f = frac_load(pq + pos + e3_off);
             n0_at1 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d0_at1 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
         }
 
         // leaf (1,1): slots pos + h_off + e_off, pos + h_off + e3_off
         {
-            FracExt lo_f = frac_load16(pq + pos + h_off + e_off);
-            FracExt hi_f = frac_load16(pq + pos + h_off + e3_off);
+            FracExt lo_f = frac_load(pq + pos + h_off + e_off);
+            FracExt hi_f = frac_load(pq + pos + h_off + e3_off);
             n1_at1 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
             d1_at1 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
         }
 
         // Store the folded leaves; every load of this thread has already happened.
-        frac_store16(pq + pos, {n0_at0, d0_at0});
-        frac_store16(pq + pos + q_off, {n1_at0, d1_at0});
-        frac_store16(pq + pos + e_off, {n0_at1, d0_at1});
-        frac_store16(pq + pos + e3_off, {n1_at1, d1_at1});
+        frac_store(pq + pos, {n0_at0, d0_at0});
+        frac_store(pq + pos + q_off, {n1_at0, d1_at0});
+        frac_store(pq + pos + e_off, {n0_at1, d0_at1});
+        frac_store(pq + pos + e3_off, {n1_at1, d1_at1});
+
+        accum_round_terms(
+            eq_lo, eq_hi, pos, lo_bits, lam,
+            n0_at0, d0_at0, n0_at1, d0_at1,
+            n1_at0, d1_at0, n1_at1, d1_at1,
+            acc_s1, acc_s2
+        );
+    }
+
+    store_pair_block_sums(red_smem, acc_s1, acc_s2, blk_sums);
+}
+
+// The fused in-place round over a virtual leaf layer, split in two launches.
+//
+// In place on a virtual layer, thread pos would overwrite slots that other threads still read
+// spilled right siblings from (openvm-org/stark-backend#331 does exactly that; it only goes
+// unnoticed while every thread sits in one warp). The leaves other threads may read are all in the
+// upper half [pq_len, 2 * pq_len), and only the upper folded entries (pos + q_off and
+// pos + e3_off) consume them, so:
+//   fold_upper_virt_kernel: reads the layer only and writes those two folded entries to
+//     upper_out[pos] and upper_out[pos + e_off] (pq_len / 2 entries, dense);
+//   compute_round_and_fold_split_kernel: reads the lower half, which every thread owns, plus
+//     upper_out, evaluates the round, and stores all four folded entries densely into the low
+//     pq_len slots of the layer.
+// After the pair the folded layer is dense, so every later round of this layer takes the dense
+// kernels. Layout and offsets are those of compute_round_and_fold_inplace_kernel.
+__global__ void fold_upper_virt_kernel(
+    const FracExt *__restrict__ pq,  // virtual, 2 * pq_len entries
+    uint32_t x_count,  // after the fold, pq_len / 2
+    FpExt fold_r,
+    FracExt *__restrict__ upper_out,  // pq_len / 2 entries
+    VirtLens vl
+) {
+    const uint32_t pq_len = 2 * x_count;
+    const uint32_t in_len = pq_len << 1;
+    const uint32_t h_off = pq_len;
+    const uint32_t q_off = pq_len >> 1;
+    const uint32_t e_off = pq_len >> 2;
+    const uint32_t e3_off = e_off * 3;
+
+    for (uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x; pos < x_count / 2;
+         pos += blockDim.x * gridDim.x) {
+        {
+            FracExt lo_f = node_load<true>(pq, pos + h_off, in_len, vl);
+            FracExt hi_f = node_load<true>(pq, pos + h_off + q_off, in_len, vl);
+            frac_store(
+                upper_out + pos,
+                {lo_f.p + fold_r * (hi_f.p - lo_f.p), lo_f.q + fold_r * (hi_f.q - lo_f.q)}
+            );
+        }
+        {
+            FracExt lo_f = node_load<true>(pq, pos + h_off + e_off, in_len, vl);
+            FracExt hi_f = node_load<true>(pq, pos + h_off + e3_off, in_len, vl);
+            frac_store(
+                upper_out + pos + e_off,
+                {lo_f.p + fold_r * (hi_f.p - lo_f.p), lo_f.q + fold_r * (hi_f.q - lo_f.q)}
+            );
+        }
+    }
+}
+
+// Dynamic shared memory: one FpExt per warp (at least one).
+__global__ void compute_round_and_fold_split_kernel(
+    const FpExt *__restrict__ eq_lo,
+    const FpExt *__restrict__ eq_hi,
+    FracExt *pq,  // virtual, 2 * pq_len entries on entry; the low pq_len slots dense on exit
+    const FracExt *__restrict__ upper_in,  // from fold_upper_virt_kernel
+    uint32_t x_count,  // after the fold, pq_len / 2
+    uint32_t lo_bits,
+    FpExt lam,
+    FpExt fold_r,
+    FpExt *__restrict__ blk_sums,  // [gridDim.x * 2]
+    VirtLens vl
+) {
+    extern __shared__ FpExt red_smem[];
+    const uint32_t pq_len = 2 * x_count;
+    const uint32_t in_len = pq_len << 1;
+    const uint32_t q_off = pq_len >> 1;
+    const uint32_t e_off = pq_len >> 2;
+    const uint32_t e3_off = e_off * 3;
+
+    const FpExt zero(Fp::zero());
+    FpExt acc_s1 = zero, acc_s2 = zero;
+
+    for (uint32_t pos = threadIdx.x + blockIdx.x * blockDim.x; pos < x_count / 2;
+         pos += blockDim.x * gridDim.x) {
+        FpExt n0_at0, d0_at0, n1_at0, d1_at0;
+        FpExt n0_at1, d0_at1, n1_at1, d1_at1;
+
+        // Lower half: the four source entries are this thread's own slots (or padding).
+        {
+            FracExt lo_f = node_load<true>(pq, pos, in_len, vl);
+            FracExt hi_f = node_load<true>(pq, pos + q_off, in_len, vl);
+            n0_at0 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
+            d0_at0 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
+        }
+        {
+            FracExt lo_f = node_load<true>(pq, pos + e_off, in_len, vl);
+            FracExt hi_f = node_load<true>(pq, pos + e3_off, in_len, vl);
+            n0_at1 = lo_f.p + fold_r * (hi_f.p - lo_f.p);
+            d0_at1 = lo_f.q + fold_r * (hi_f.q - lo_f.q);
+        }
+        // Upper half, already folded.
+        {
+            FracExt f = frac_load(upper_in + pos);
+            n1_at0 = f.p;
+            d1_at0 = f.q;
+        }
+        {
+            FracExt f = frac_load(upper_in + pos + e_off);
+            n1_at1 = f.p;
+            d1_at1 = f.q;
+        }
+
+        frac_store(pq + pos, {n0_at0, d0_at0});
+        frac_store(pq + pos + q_off, {n1_at0, d1_at0});
+        frac_store(pq + pos + e_off, {n0_at1, d0_at1});
+        frac_store(pq + pos + e3_off, {n1_at1, d1_at1});
 
         accum_round_terms(
             eq_lo, eq_hi, pos, lo_bits, lam,
@@ -466,7 +693,13 @@ __global__ void compute_round_and_fold_inplace_kernel(
 // Since pos ranges over [0, x_count/2), the pairs {pos, pos + q_off} partition [0, h_off),
 // so each low slot has exactly one writer.
 //
+// Virtual: parents are entries of the layer above (h_off entries), children of the layer below
+// (pq_len entries). A child slot written here is the thread's own parent slot or is dropped as
+// padding, and the spilled right siblings other threads read sit in padding holes, so the
+// in-place revert stays race-free.
+//
 // Dynamic shared memory: one FpExt per warp (at least one).
+template <bool VIRT>
 __global__ void compute_round_and_revert_kernel(
     const FpExt *__restrict__ eq_lo,
     const FpExt *__restrict__ eq_hi,
@@ -474,7 +707,8 @@ __global__ void compute_round_and_revert_kernel(
     uint32_t x_count,
     uint32_t lo_bits,
     FpExt lam,
-    FpExt *__restrict__ blk_sums  // [gridDim.x * 2]
+    FpExt *__restrict__ blk_sums,  // [gridDim.x * 2]
+    VirtLens vl
 ) {
     extern __shared__ FpExt red_smem[];
     const uint32_t pq_len = 2 * x_count;
@@ -496,26 +730,26 @@ __global__ void compute_round_and_revert_kernel(
 
         // leaf (0,0) recovered from its merge with leaf (1,0)
         {
-            FracExt left = frac_load16(nodes + pos);
-            FracExt right = frac_load16(nodes + pos + h_off);
+            FracExt left = node_load<VIRT>(nodes, pos, h_off, vl);
+            FracExt right = node_load<VIRT>(nodes, pos + h_off, pq_len, vl);
             FpExt right_q_inv = inv(right.q);
             d0_at0 = left.q * right_q_inv;
             n0_at0 = (left.p - d0_at0 * right.p) * right_q_inv;
             n1_at0 = right.p;
             d1_at0 = right.q;
-            frac_store16(nodes + pos, {n0_at0, d0_at0});
+            node_store<VIRT>(nodes, pos, pq_len, vl, {n0_at0, d0_at0});
         }
 
         // leaf (0,1) recovered from its merge with leaf (1,1)
         {
-            FracExt left = frac_load16(nodes + pos + q_off);
-            FracExt right = frac_load16(nodes + pos + h_off + q_off);
+            FracExt left = node_load<VIRT>(nodes, pos + q_off, h_off, vl);
+            FracExt right = node_load<VIRT>(nodes, pos + h_off + q_off, pq_len, vl);
             FpExt right_q_inv = inv(right.q);
             d0_at1 = left.q * right_q_inv;
             n0_at1 = (left.p - d0_at1 * right.p) * right_q_inv;
             n1_at1 = right.p;
             d1_at1 = right.q;
-            frac_store16(nodes + pos + q_off, {n0_at1, d0_at1});
+            node_store<VIRT>(nodes, pos + q_off, pq_len, vl, {n0_at1, d0_at1});
         }
 
         accum_round_terms(
@@ -539,7 +773,8 @@ constexpr uint32_t TAIL_CHUNK = 16;
 // Partial M matrices: block x sums over its own range [t_begin, t_end) of tail points
 // and writes a complete 2^w x 2^w matrix. Thread (ri, ci) of the 2D block owns entry
 // (ri, ci). Shared tiles have row pitch side + 1 so that column reads do not conflict.
-template <bool fold_inline, uint32_t LOGW>
+// Virtual (fold_inline only): pq is a virtual layer of 2^(n_rem + 2) entries.
+template <bool fold_inline, uint32_t LOGW, bool VIRT>
 __global__ void precompute_m_build_partial_kernel(
     const FracExt *__restrict__ pq,
     uint32_t n_rem,  // variable count after the fold
@@ -549,8 +784,10 @@ __global__ void precompute_m_build_partial_kernel(
     const FpExt *__restrict__ tail_eq_hi,
     uint32_t tail_lo_bits,
     uint32_t tile_len,
-    FpExt *__restrict__ partials
+    FpExt *__restrict__ partials,
+    VirtLens vl
 ) {
+    static_assert(fold_inline || !VIRT, "a virtual source is only read with the inline fold");
     constexpr uint32_t side = 1u << LOGW;
     uint32_t ri = threadIdx.y;
     uint32_t ci = threadIdx.x;
@@ -564,6 +801,7 @@ __global__ void precompute_m_build_partial_kernel(
     // otherwise it already has n_rem variables.
     uint32_t fold_off = fold_inline ? (1u << n_rem) : 0;
     uint32_t poly_off = fold_inline ? (1u << (n_rem + 1)) : (1u << n_rem);
+    uint32_t src_len = poly_off << 1;  // active entries of pq
 
     uint32_t t_begin = blockIdx.x * tile_len;
     uint32_t t_end = min(t_begin + tile_len, tail_len);
@@ -608,18 +846,18 @@ __global__ void precompute_m_build_partial_kernel(
             FpExt n0, d0, n1, d1;
             if constexpr (fold_inline) {
                 // Fold each component as lo + fold_r * (hi - lo).
-                FracExt lo0 = frac_load16(&pq[flat]);
-                FracExt hi0 = frac_load16(&pq[flat + fold_off]);
-                FracExt lo1 = frac_load16(&pq[poly_off + flat]);
-                FracExt hi1 = frac_load16(&pq[poly_off + flat + fold_off]);
+                FracExt lo0 = node_load<VIRT>(pq, flat, src_len, vl);
+                FracExt hi0 = node_load<VIRT>(pq, flat + fold_off, src_len, vl);
+                FracExt lo1 = node_load<VIRT>(pq, poly_off + flat, src_len, vl);
+                FracExt hi1 = node_load<VIRT>(pq, poly_off + flat + fold_off, src_len, vl);
                 n0 = lo0.p + fold_r * (hi0.p - lo0.p);
                 d0 = lo0.q + fold_r * (hi0.q - lo0.q);
                 n1 = lo1.p + fold_r * (hi1.p - lo1.p);
                 d1 = lo1.q + fold_r * (hi1.q - lo1.q);
             } else {
                 // Already folded: plain loads.
-                FracExt fr0 = frac_load16(&pq[flat]);
-                FracExt fr1 = frac_load16(&pq[poly_off + flat]);
+                FracExt fr0 = frac_load(&pq[flat]);
+                FracExt fr1 = frac_load(&pq[poly_off + flat]);
                 n0 = fr0.p; d0 = fr0.q;
                 n1 = fr1.p; d1 = fr1.q;
             }
@@ -658,7 +896,7 @@ __global__ void precompute_m_build_partial_kernel(
     partials[blockIdx.x * (side * side) + ri * side + ci] = m_entry;
 }
 
-template <bool fold_inline, uint32_t LOGW>
+template <bool fold_inline, bool VIRT, uint32_t LOGW>
 inline void launch_m_window_partial(
     dim3 launch_grid,
     const FracExt *pq,
@@ -669,14 +907,15 @@ inline void launch_m_window_partial(
     const FpExt *tail_eq_hi,
     uint32_t tail_lo_bits,
     uint32_t tile_len,
-    FpExt *partials
+    FpExt *partials,
+    VirtLens vl
 ) {
     constexpr uint32_t side = 1u << LOGW;
     dim3 launch_block(side, side);
     constexpr uint32_t pad_stride = side + 1;  // same padded pitch as the kernel
     size_t smem_bytes =
         (4 * pad_stride * TAIL_CHUNK + TAIL_CHUNK) * sizeof(FpExt);
-    precompute_m_build_partial_kernel<fold_inline, LOGW><<<launch_grid, launch_block, smem_bytes>>>(
+    precompute_m_build_partial_kernel<fold_inline, LOGW, VIRT><<<launch_grid, launch_block, smem_bytes>>>(
         pq,
         n_rem,
         lam,
@@ -685,11 +924,12 @@ inline void launch_m_window_partial(
         tail_eq_hi,
         tail_lo_bits,
         tile_len,
-        partials
+        partials,
+        vl
     );
 }
 
-template <bool fold_inline>
+template <bool fold_inline, bool VIRT>
 inline int dispatch_m_window_partial(
     uint32_t wbits,
     dim3 launch_grid,
@@ -701,18 +941,19 @@ inline int dispatch_m_window_partial(
     const FpExt *tail_eq_hi,
     uint32_t tail_lo_bits,
     uint32_t tile_len,
-    FpExt *partials
+    FpExt *partials,
+    VirtLens vl
 ) {
     using PartialFn = void (*)(
         dim3, const FracExt *, uint32_t, FpExt, FpExt, const FpExt *, const FpExt *, uint32_t,
-        uint32_t, FpExt *
+        uint32_t, FpExt *, VirtLens
     );
     static constexpr PartialFn table[] = {
-        &launch_m_window_partial<fold_inline, 1>,
-        &launch_m_window_partial<fold_inline, 2>,
-        &launch_m_window_partial<fold_inline, 3>,
-        &launch_m_window_partial<fold_inline, 4>,
-        &launch_m_window_partial<fold_inline, 5>,
+        &launch_m_window_partial<fold_inline, VIRT, 1>,
+        &launch_m_window_partial<fold_inline, VIRT, 2>,
+        &launch_m_window_partial<fold_inline, VIRT, 3>,
+        &launch_m_window_partial<fold_inline, VIRT, 4>,
+        &launch_m_window_partial<fold_inline, VIRT, 5>,
     };
 
     constexpr uint32_t w_lo = 1;
@@ -732,7 +973,8 @@ inline int dispatch_m_window_partial(
         tail_eq_hi,
         tail_lo_bits,
         tile_len,
-        partials
+        partials,
+        vl
     );
     return 0;
 }
@@ -822,12 +1064,16 @@ __global__ void precompute_m_eval_round_kernel(
 
 // Folds wbits variables in a single pass using the eq table of the window challenges;
 // each thread produces column col of both polynomials.
-template <uint32_t LOGW>
+//
+// Virtual: in_ptr is a virtual layer of 2^(LOGW + 1) * n_cols entries; out_ptr is dense and does
+// not alias it (a virtual source can hand one thread's entry to another's slot).
+template <uint32_t LOGW, bool VIRT>
 __global__ void multifold_kernel(
     const FracExt *in_ptr,
     FracExt *out_ptr,
     uint32_t n_cols,
-    const FpExt *__restrict__ win_eq
+    const FpExt *__restrict__ win_eq,
+    VirtLens vl
 ) {
     constexpr uint32_t n_beta = 1u << LOGW;
     uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -840,11 +1086,13 @@ __global__ void multifold_kernel(
     FpExt d0_sum = zero;
     FpExt n1_sum = zero;
     FpExt d1_sum = zero;
+    const uint32_t hi_off = n_cols << LOGW;
+    const uint32_t src_len = hi_off << 1;  // active entries of in_ptr
     const FracExt *src_hi = in_ptr + ((size_t)n_cols << LOGW);
     for (uint32_t bk = 0; bk < n_beta; ++bk) {
         uint32_t pos = bk * n_cols + col;
-        FracExt fv0 = in_ptr[pos];
-        FracExt fv1 = src_hi[pos];
+        FracExt fv0 = VIRT ? node_load<VIRT>(in_ptr, pos, src_len, vl) : in_ptr[pos];
+        FracExt fv1 = VIRT ? node_load<VIRT>(in_ptr, hi_off + pos, src_len, vl) : src_hi[pos];
         FpExt wgt_r = win_eq[bk];
         n0_sum += wgt_r * fv0.p;
         d0_sum += wgt_r * fv0.q;
@@ -889,19 +1137,22 @@ __global__ void frac_vector_scalar_multiply_kernel(
 //
 // Per group of four this does 4 loads + 2 stores instead of 6 loads + 3 stores for two
 // single-layer passes, about a third less traffic.
+template <bool VIRT>
 __global__ void frac_build_tree_two_layers_kernel(
     FracExt *__restrict__ nodes,
-    uint32_t h_inner  // N >> (i+2), i = first of the two layers
+    uint32_t h_inner,  // N >> (i+2), i = first of the two layers
+    VirtLens vl
 ) {
     uint32_t lane_t = blockIdx.x * blockDim.x + threadIdx.x;
     if (lane_t >= h_inner) return;
 
     uint32_t h_outer = h_inner << 1;  // N >> (i+1)
+    uint32_t below = h_inner << 2;  // entries of layer i's input
 
-    FracExt fa = frac_load16(nodes + lane_t);
-    FracExt fb = frac_load16(nodes + lane_t + h_inner);
-    FracExt fc = frac_load16(nodes + lane_t + h_outer);
-    FracExt fd = frac_load16(nodes + lane_t + h_outer + h_inner);
+    FracExt fa = node_load<VIRT>(nodes, lane_t, below, vl);
+    FracExt fb = node_load<VIRT>(nodes, lane_t + h_inner, below, vl);
+    FracExt fc = node_load<VIRT>(nodes, lane_t + h_outer, below, vl);
+    FracExt fd = node_load<VIRT>(nodes, lane_t + h_outer + h_inner, below, vl);
 
     // layer i (results stay in registers)
     FracExt left = frac_add(fa, fc);
@@ -909,8 +1160,8 @@ __global__ void frac_build_tree_two_layers_kernel(
     // layer i+1
     FracExt merged = frac_add(left, right);
 
-    frac_store16(nodes + lane_t, merged);
-    frac_store16(nodes + lane_t + h_inner, right);  // kept for undoing layer i+1
+    node_store<VIRT>(nodes, lane_t, h_inner, vl, merged);
+    node_store<VIRT>(nodes, lane_t + h_inner, h_outer, vl, right);  // kept for undoing layer i+1
     // nodes[t + h_outer] and nodes[t + h_outer + h_inner] are left untouched; undoing
     // layer i reads them.
 }
@@ -918,19 +1169,39 @@ __global__ void frac_build_tree_two_layers_kernel(
 // ----------------------------------------------------------------------------
 // Host side
 // ----------------------------------------------------------------------------
+// Lengths of a buffer for the launchers: real_len < logical_len selects the virtual instance.
+inline VirtLens make_virt_lens(size_t real_len, size_t logical_len, const FpExt *pad_dens) {
+    return VirtLens{(uint32_t)real_len, (uint32_t)logical_len, pad_dens};
+}
+
 template <bool undo, bool with_alpha>
 int launch_frac_build_tree_layer(FracExt *nodes, size_t node_count, FpExt den_shift) {
     auto [launch_grid, launch_block] = kernel_launch_params(node_count);
-    frac_build_tree_layer_kernel<undo, with_alpha><<<launch_grid, launch_block>>>(nodes, node_count, den_shift);
+    frac_build_tree_layer_kernel<undo, with_alpha><<<launch_grid, launch_block>>>(
+        nodes, node_count, den_shift, VirtLens{0, 0, nullptr}
+    );
     return CHECK_KERNEL();
 }
 
+template <bool undo>
+int launch_frac_build_tree_layer_virt(FracExt *nodes, size_t node_count, VirtLens vl) {
+    auto [launch_grid, launch_block] = kernel_launch_params(node_count);
+    frac_build_tree_layer_kernel<undo, false, true><<<launch_grid, launch_block>>>(
+        nodes, node_count, FpExt(Fp::zero()), vl
+    );
+    return CHECK_KERNEL();
+}
+
+// real_len < logical_len: nodes is virtual (see virt_load); only internal layers, no shift.
 extern "C" int _kb_frac_build_tree_layer(
     FracExt *nodes,
     size_t node_count,
+    size_t real_len,
+    size_t logical_len,
     bool undo,
     FpExt den_shift,
-    bool with_alpha
+    bool with_alpha,
+    const FpExt *pad_dens  // virtual only, see virt_load
 ) {
     if (node_count == 0) {
         return 0;
@@ -938,6 +1209,14 @@ extern "C" int _kb_frac_build_tree_layer(
     assert(node_count % 2 == 0);
     node_count /= 2;
 
+    if (real_len < logical_len) {
+        if (with_alpha) {
+            return cudaErrorInvalidValue;
+        }
+        VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
+        return undo ? launch_frac_build_tree_layer_virt<true>(nodes, node_count, vl)
+                    : launch_frac_build_tree_layer_virt<false>(nodes, node_count, vl);
+    }
     return DISPATCH_BOOL_PAIR(
         launch_frac_build_tree_layer, undo, with_alpha, nodes, node_count, den_shift
     );
@@ -945,13 +1224,24 @@ extern "C" int _kb_frac_build_tree_layer(
 
 // Two-layer tree build. h_inner = N >> (i+2) with i the first of the two layers;
 // needs h_inner >= 1 and 4 * h_inner <= buffer length.
-extern "C" int _kb_frac_build_tree_two_layers(FracExt *nodes, size_t h_inner) {
+extern "C" int _kb_frac_build_tree_two_layers(
+    FracExt *nodes,
+    size_t h_inner,
+    size_t real_len,
+    size_t logical_len,
+    const FpExt *pad_dens
+) {
     if (h_inner == 0) return 0;
     // 256 threads per block leave more registers per thread than 1024 would; this
     // kernel keeps four fractions and three merges in flight, more than the
     // single-layer kernel.
     auto [launch_grid, launch_block] = kernel_launch_params(h_inner, 256);
-    frac_build_tree_two_layers_kernel<<<launch_grid, launch_block>>>(nodes, (uint32_t)h_inner);
+    VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
+    if (real_len < logical_len) {
+        frac_build_tree_two_layers_kernel<true><<<launch_grid, launch_block>>>(nodes, (uint32_t)h_inner, vl);
+    } else {
+        frac_build_tree_two_layers_kernel<false><<<launch_grid, launch_block>>>(nodes, (uint32_t)h_inner, vl);
+    }
     return CHECK_KERNEL();
 }
 
@@ -1058,8 +1348,11 @@ extern "C" int _kb_frac_compute_round_and_revert(
     const FpExt *eq_hi,
     FracExt *nodes,  // low half restored in place
     size_t x_count,
+    size_t real_len,  // < logical_len: nodes is virtual
+    size_t logical_len,
     size_t eq_lo_len,
     FpExt lam,
+    const FpExt *pad_dens,
     FpExt *evals_out,  // s'(1), s'(2)
     FpExt *scratch_sums  // gridDim.x * 2 per-block sums
 ) {
@@ -1067,16 +1360,20 @@ extern "C" int _kb_frac_compute_round_and_revert(
 
     auto [launch_grid, launch_block] = round_launch_shape(x_count);
     size_t smem_bytes = div_ceil(launch_block.x, WARP_SIZE) * sizeof(FpExt);
+    VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
 
     // undo + round evaluation
-    compute_round_and_revert_kernel<<<launch_grid, launch_block, smem_bytes>>>(
+    auto *kernel = real_len < logical_len ? compute_round_and_revert_kernel<true>
+                                          : compute_round_and_revert_kernel<false>;
+    kernel<<<launch_grid, launch_block, smem_bytes>>>(
         eq_lo,
         eq_hi,
         nodes,
         (uint32_t)x_count,
         __builtin_ctz((uint32_t)eq_lo_len),
         lam,
-        scratch_sums
+        scratch_sums,
+        vl
     );
     int rc = CHECK_KERNEL();
     if (rc != 0)
@@ -1094,9 +1391,12 @@ extern "C" int _kb_frac_compute_round_and_fold(
     const FracExt *pq_in_buf,
     FracExt *pq_out_buf,
     size_t src_len,  // unfolded FracExt count
+    size_t real_len,  // < logical_len: pq_in_buf is virtual (pq_out_buf is dense)
+    size_t logical_len,
     size_t eq_lo_len,
     FpExt lam,
     FpExt fold_r,
+    const FpExt *pad_dens,
     FpExt *evals_out,  // s'(1), s'(2)
     FpExt *scratch_sums  // gridDim.x * 2 per-block sums
 ) {
@@ -1108,9 +1408,12 @@ extern "C" int _kb_frac_compute_round_and_fold(
 
     auto [launch_grid, launch_block] = round_launch_shape(x_count);
     size_t smem_bytes = div_ceil(launch_block.x, WARP_SIZE) * sizeof(FpExt);
+    VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
 
     // round + fold; fills scratch_sums and pq_out_buf
-    compute_round_and_fold_kernel<<<launch_grid, launch_block, smem_bytes>>>(
+    auto *kernel = real_len < logical_len ? compute_round_and_fold_kernel<true>
+                                          : compute_round_and_fold_kernel<false>;
+    kernel<<<launch_grid, launch_block, smem_bytes>>>(
         eq_lo,
         eq_hi,
         pq_in_buf,
@@ -1119,13 +1422,65 @@ extern "C" int _kb_frac_compute_round_and_fold(
         lam,
         fold_r,
         scratch_sums,
-        pq_out_buf
+        pq_out_buf,
+        vl
     );
     int rc = CHECK_KERNEL();
     if (rc != 0)
         return rc;
 
     // second stage: fold scratch_sums into evals_out
+    return gkr_final_reduce(scratch_sums, evals_out, launch_grid.x);
+}
+
+// The fused in-place round over a virtual layer (see fold_upper_virt_kernel): upper_scratch
+// receives src_len / 4 folded entries and must not alias pq_buf; on return the low src_len / 2
+// slots of pq_buf hold the folded layer, dense.
+extern "C" int _kb_frac_compute_round_and_fold_split(
+    const FpExt *eq_lo,
+    const FpExt *eq_hi,
+    FracExt *pq_buf,  // virtual, src_len entries on entry
+    FracExt *upper_scratch,  // src_len / 4 entries
+    size_t src_len,  // unfolded FracExt count
+    size_t real_len,
+    size_t logical_len,
+    size_t eq_lo_len,
+    FpExt lam,
+    FpExt fold_r,
+    const FpExt *pad_dens,
+    FpExt *evals_out,  // s'(1), s'(2)
+    FpExt *scratch_sums  // gridDim.x * 2 per-block sums
+) {
+    assert(src_len > 4);
+    assert(real_len < logical_len);
+    size_t pq_len = src_len >> 1;
+    size_t x_count = pq_len >> 1;
+
+    auto [launch_grid, launch_block] = round_launch_shape(x_count);
+    size_t smem_bytes = div_ceil(launch_block.x, WARP_SIZE) * sizeof(FpExt);
+    VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
+
+    fold_upper_virt_kernel<<<launch_grid, launch_block>>>(
+        pq_buf, (uint32_t)x_count, fold_r, upper_scratch, vl
+    );
+    int rc = CHECK_KERNEL();
+    if (rc != 0)
+        return rc;
+    compute_round_and_fold_split_kernel<<<launch_grid, launch_block, smem_bytes>>>(
+        eq_lo,
+        eq_hi,
+        pq_buf,
+        upper_scratch,
+        (uint32_t)x_count,
+        __builtin_ctz((uint32_t)eq_lo_len),
+        lam,
+        fold_r,
+        scratch_sums,
+        vl
+    );
+    rc = CHECK_KERNEL();
+    if (rc != 0)
+        return rc;
     return gkr_final_reduce(scratch_sums, evals_out, launch_grid.x);
 }
 
@@ -1170,12 +1525,16 @@ extern "C" int _kb_frac_compute_round_and_fold_inplace(
     return gkr_final_reduce(scratch_sums, evals_out, launch_grid.x);
 }
 
+// real_len < logical_len: pq is virtual, which only the inline-fold (first window) read allows.
 extern "C" int _kb_frac_precompute_m_build(
     const FracExt *pq,
+    size_t real_len,
+    size_t logical_len,
     size_t n_rem,  // variable count after the fold
     size_t wbits,
     FpExt lam,
     FpExt fold_r,  // only read when fold_inline
+    const FpExt *pad_dens,
     bool fold_inline,  // true: pq still has n_rem + 1 variables
     const FpExt *tail_eq_lo,
     const FpExt *tail_eq_hi,
@@ -1202,8 +1561,12 @@ extern "C" int _kb_frac_precompute_m_build(
     dim3 launch_grid(n_parts);
     uint32_t tail_lo_bits = __builtin_ctz((uint32_t)tail_eq_lo_len);
     int dispatch_rc = 0;
-    if (fold_inline) {
-        dispatch_rc = dispatch_m_window_partial<true>(
+    VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
+    if (real_len < logical_len) {
+        if (!fold_inline) {
+            return cudaErrorInvalidValue;
+        }
+        dispatch_rc = dispatch_m_window_partial<true, true>(
             w32,
             launch_grid,
             pq,
@@ -1214,10 +1577,26 @@ extern "C" int _kb_frac_precompute_m_build(
             tail_eq_hi,
             tail_lo_bits,
             tile32,
-            partials
+            partials,
+            vl
+        );
+    } else if (fold_inline) {
+        dispatch_rc = dispatch_m_window_partial<true, false>(
+            w32,
+            launch_grid,
+            pq,
+            n_rem32,
+            lam,
+            fold_r,
+            tail_eq_lo,
+            tail_eq_hi,
+            tail_lo_bits,
+            tile32,
+            partials,
+            vl
         );
     } else {
-        dispatch_rc = dispatch_m_window_partial<false>(
+        dispatch_rc = dispatch_m_window_partial<false, false>(
             w32,
             launch_grid,
             pq,
@@ -1228,7 +1607,8 @@ extern "C" int _kb_frac_precompute_m_build(
             tail_eq_hi,
             tail_lo_bits,
             tile32,
-            partials
+            partials,
+            vl
         );
     }
     if (dispatch_rc != 0) {
@@ -1274,11 +1654,15 @@ extern "C" int _kb_frac_precompute_m_eval_round(
     return CHECK_KERNEL();
 }
 
+// real_len < logical_len: in_ptr is virtual; out_ptr must not alias it then.
 extern "C" int _kb_frac_multifold(
     const FracExt *in_ptr,
     FracExt *out_ptr,
+    size_t real_len,
+    size_t logical_len,
     size_t n_rem,
     size_t wbits,
+    const FpExt *pad_dens,
     const FpExt *win_eq
 ) {
     assert(n_rem > 0);
@@ -1286,9 +1670,15 @@ extern "C" int _kb_frac_multifold(
 
     size_t col_count = 1u << (n_rem - wbits);
     auto [launch_grid, launch_block] = kernel_launch_params(col_count, 256);
+    VirtLens vl = make_virt_lens(real_len, logical_len, pad_dens);
+    bool virt = real_len < logical_len;
 
 #define DISPATCH_MULTIFOLD(LOGW) \
-    multifold_kernel<LOGW><<<launch_grid, launch_block>>>(in_ptr, out_ptr, (uint32_t)col_count, win_eq); \
+    if (virt) { \
+        multifold_kernel<LOGW, true><<<launch_grid, launch_block>>>(in_ptr, out_ptr, (uint32_t)col_count, win_eq, vl); \
+    } else { \
+        multifold_kernel<LOGW, false><<<launch_grid, launch_block>>>(in_ptr, out_ptr, (uint32_t)col_count, win_eq, vl); \
+    } \
     return CHECK_KERNEL();
 
     switch (wbits) {
@@ -1301,9 +1691,26 @@ extern "C" int _kb_frac_multifold(
 #undef DISPATCH_MULTIFOLD
 }
 
-extern "C" int _kb_frac_fold_fpext_columns(const FracExt *in_ptr, FracExt *out_ptr, size_t n_frac, FpExt chal) {
+// real_len < logical_len: in_ptr is virtual; out_ptr is dense and must not alias it then.
+extern "C" int _kb_frac_fold_fpext_columns(
+    const FracExt *in_ptr,
+    FracExt *out_ptr,
+    size_t n_frac,
+    size_t real_len,
+    size_t logical_len,
+    FpExt chal,
+    const FpExt *pad_dens
+) {
     if (n_frac <= 2) {
         return 0;
+    }
+    if (real_len < logical_len) {
+        uint32_t q_frac = n_frac >> 2;
+        auto [launch_grid, launch_block] = kernel_launch_params(q_frac);
+        fold_frac_columns_virt_kernel<<<launch_grid, launch_block>>>(
+            in_ptr, out_ptr, (uint32_t)n_frac, chal, make_virt_lens(real_len, logical_len, pad_dens)
+        );
+        return CHECK_KERNEL();
     }
     // Kernel works on the FpExt view: each FracExt is two FpExt, so a quarter of the
     // FpExt length is (n_frac / 4) * 2 = n_frac / 2.
@@ -1343,6 +1750,39 @@ Word bit_rev(Word word, unsigned int width)
     return __brev(word) >> (8 * sizeof(unsigned int) - width);
 }
 
+// Slot access for the bit-reversal kernels. In a virtual buffer (real_len < 2^log_n) an input slot
+// at or past real_len is padding, zero before the shift, and an output goes through virt_store at
+// the layer its tile row belongs to: row i of a written tile holds a node of the layer with
+// 2^log_n >> layer_shift entries. Every slot a tile pair stores to lies in the pair's own slots
+// (an output at pos < real_len in its own slot, a leaf past it at its natural index, which the
+// bit reversal maps into the mirrored tile), so the in-place pass stays race-free.
+template <bool VIRT>
+__device__ __forceinline__ FracExt k2_in(const FracExt *buf, index_t pos, uint32_t real_len) {
+    if constexpr (VIRT) {
+        if (pos >= real_len) {
+            return {FpExt(Fp::zero()), FpExt(Fp::zero())};
+        }
+    }
+    return buf[pos];
+}
+
+template <bool VIRT>
+__device__ __forceinline__ void k2_out(
+    FracExt *buf,
+    index_t pos,
+    uint32_t layer_shift,
+    uint32_t real_len,
+    uint32_t log_n,
+    FracExt const &val
+) {
+    if constexpr (VIRT) {
+        uint32_t logical = 1u << log_n;
+        virt_store(buf, pos, logical >> layer_shift, real_len, logical, val);
+    } else {
+        buf[pos] = val;
+    }
+}
+
 // In-place bit-reversal of one FracExt buffer that also shifts every denominator by
 // den_shift and applies two tree layers (K = 2) while the data sits in shared memory,
 // saving two separate passes over the buffer. The permutation follows the 8-wide
@@ -1360,10 +1800,13 @@ Word bit_rev(Word word, unsigned int width)
 // about twice as fast as 32 standalone (1525 vs 754 GB/s, lg=24, RTX 5090). The
 // resulting 64 KB of dynamic shared memory needs an opt-in attribute, which the
 // launcher sets once per device.
+template <bool VIRT>
 __launch_bounds__(256) __global__
 void bit_rev_frac_build_k2_kernel(
-    FracExt* buf, uint32_t log_n, FpExt den_shift)
+    FracExt* buf, uint32_t log_n, FpExt den_shift, uint32_t real_len)
 {
+    // layer of each written tile row: [0,1] two merges up, [2,3] one, [4..7] leaves
+    constexpr uint32_t ROW_LAYER[8] = {2, 2, 1, 1, 0, 0, 0, 0};
     constexpr uint32_t TILE_W = 8;
     constexpr uint32_t LOG_TILE_W = 3;
 
@@ -1393,9 +1836,9 @@ void bit_rev_frac_build_k2_kernel(
 
         #pragma unroll
         for (uint32_t i = 0; i < TILE_W; i++) {
-            tiles[tile_id][i][lane_rev] = (held[i] = buf[i * z_stride + fwd_base]);
+            tiles[tile_id][i][lane_rev] = (held[i] = k2_in<VIRT>(buf, i * z_stride + fwd_base, real_len));
             if (grp != grp_rev)
-                held[i] = buf[i * z_stride + rev_base];
+                held[i] = k2_in<VIRT>(buf, i * z_stride + rev_base, real_len);
         }
 
         __syncwarp();
@@ -1415,7 +1858,7 @@ void bit_rev_frac_build_k2_kernel(
         }
         #pragma unroll
         for (uint32_t i = 0; i < TILE_W; i++)
-            buf[i * z_stride + rev_base] = tiles[tile_id][lane_rev][i];
+            k2_out<VIRT>(buf, i * z_stride + rev_base, ROW_LAYER[i], real_len, log_n, tiles[tile_id][lane_rev][i]);
 
         if (grp == grp_rev)
             continue;
@@ -1443,32 +1886,26 @@ void bit_rev_frac_build_k2_kernel(
         }
         #pragma unroll
         for (uint32_t i = 0; i < TILE_W; i++)
-            buf[i * z_stride + fwd_base] = tiles[tile_id][lane_rev][i];
+            k2_out<VIRT>(buf, i * z_stride + fwd_base, ROW_LAYER[i], real_len, log_n, tiles[tile_id][lane_rev][i]);
 
     } while ((walk += blockDim.x*gridDim.x) < z_stride);
     // The tile width is 8, always within a warp, so the warp-size guard used by the
     // generic permutation is not needed here.
 }
 
-// uint4-based variant of bit_rev_frac_build_k2_kernel. A FracExt is 8
-// u32 with only 4-byte alignment, so a struct copy turns into 8 scalar 4-byte accesses;
-// with the 32-byte stride between threads that kept LSU/L2 at 96% while DRAM sat at
-// 26% (ncu, lg=27). Each FracExt starts on a 32-byte boundary, so it can be moved as two
-// 16-byte uint4 instead: the same bytes with a quarter of the transactions. The tile
+// Variant of bit_rev_frac_build_k2_kernel with padded tile rows and tree layer 2 fused (see
+// below). Over KoalaBear^4 it also moved each 32-byte FracExt as two uint4; a KoalaBear^5
+// FracExt is 40 bytes, 4-byte aligned, and moves as plain words (see ext_load). The tile
 // arithmetic is unchanged from the scalar kernel.
-__device__ __forceinline__ void frac_copy16(FracExt *out_ptr, const FracExt *in_ptr) {
-    const uint4 *s = reinterpret_cast<const uint4 *>(in_ptr);
-    uint4 *d = reinterpret_cast<uint4 *>(out_ptr);
-    uint4 a = s[0];
-    uint4 b = s[1];
-    d[0] = a;
-    d[1] = b;
-}
+__device__ __forceinline__ void frac_copy(FracExt *out_ptr, const FracExt *in_ptr) { *out_ptr = *in_ptr; }
 
+template <bool VIRT>
 __launch_bounds__(256) __global__
 void bit_rev_frac_build_k2_vec_kernel(
-    FracExt* buf, uint32_t log_n, FpExt den_shift)
+    FracExt* buf, uint32_t log_n, FpExt den_shift, uint32_t real_len)
 {
+    // layer of each written tile row: [0] three merges up, [1] two, [2,3] one, [4..7] leaves
+    constexpr uint32_t ROW_LAYER[8] = {3, 2, 1, 1, 0, 0, 0, 0};
     constexpr uint32_t TILE_W = 8;
     constexpr uint32_t LOG_TILE_W = 3;
     // Rows padded to 9 FracExt: with a 256-byte row pitch, the transposed read
@@ -1498,16 +1935,16 @@ void bit_rev_frac_build_k2_vec_kernel(
         index_t fwd_base = grp * TILE_W + pos;
         index_t rev_base = grp_rev * TILE_W + pos;
 
-        uint4 held_lo[TILE_W], held_hi[TILE_W];
+        FracExt held[TILE_W];
 
         #pragma unroll
         for (uint32_t i = 0; i < TILE_W; i++) {
-            frac_copy16(&K2_CELL(tile_id, i, lane_rev), buf + i * z_stride + fwd_base);
-            if (grp != grp_rev) {
-                const uint4 *s = reinterpret_cast<const uint4 *>(buf + i * z_stride + rev_base);
-                held_lo[i] = s[0];
-                held_hi[i] = s[1];
-            }
+            if constexpr (VIRT)
+                K2_CELL(tile_id, i, lane_rev) = k2_in<VIRT>(buf, i * z_stride + fwd_base, real_len);
+            else
+                frac_copy(&K2_CELL(tile_id, i, lane_rev), buf + i * z_stride + fwd_base);
+            if (grp != grp_rev)
+                held[i] = k2_in<VIRT>(buf, i * z_stride + rev_base, real_len);
         }
 
         __syncwarp();
@@ -1529,8 +1966,12 @@ void bit_rev_frac_build_k2_vec_kernel(
             frac_add_inplace(row[0], row[1]);
         }
         #pragma unroll
-        for (uint32_t i = 0; i < TILE_W; i++)
-            frac_copy16(buf + i * z_stride + rev_base, &K2_CELL(tile_id, lane_rev, i));
+        for (uint32_t i = 0; i < TILE_W; i++) {
+            if constexpr (VIRT)
+                k2_out<VIRT>(buf, i * z_stride + rev_base, ROW_LAYER[i], real_len, log_n, K2_CELL(tile_id, lane_rev, i));
+            else
+                frac_copy(buf + i * z_stride + rev_base, &K2_CELL(tile_id, lane_rev, i));
+        }
 
         if (grp == grp_rev)
             continue;
@@ -1539,9 +1980,7 @@ void bit_rev_frac_build_k2_vec_kernel(
 
         #pragma unroll
         for (uint32_t i = 0; i < TILE_W; i++) {
-            uint4 *d = reinterpret_cast<uint4 *>(&K2_CELL(tile_id, i, lane_rev));
-            d[0] = held_lo[i];
-            d[1] = held_hi[i];
+            K2_CELL(tile_id, i, lane_rev) = held[i];
         }
 
         __syncwarp();
@@ -1561,21 +2000,26 @@ void bit_rev_frac_build_k2_vec_kernel(
             frac_add_inplace(row[0], row[1]);  // layer 2 (K=3)
         }
         #pragma unroll
-        for (uint32_t i = 0; i < TILE_W; i++)
-            frac_copy16(buf + i * z_stride + fwd_base, &K2_CELL(tile_id, lane_rev, i));
+        for (uint32_t i = 0; i < TILE_W; i++) {
+            if constexpr (VIRT)
+                k2_out<VIRT>(buf, i * z_stride + fwd_base, ROW_LAYER[i], real_len, log_n, K2_CELL(tile_id, lane_rev, i));
+            else
+                frac_copy(buf + i * z_stride + fwd_base, &K2_CELL(tile_id, lane_rev, i));
+        }
 
     } while ((walk += blockDim.x*gridDim.x) < z_stride);
 #undef K2_CELL
 }
 
 // Bit-reversal plus fused tree layers for one FracExt buffer (needs at least 256
-// elements for the tiled kernel). Denominators are shifted by den_shift first.
-extern "C" int _kb_gkr_bit_rev_frac_ext_build_k2(
-    FracExt* buf, uint32_t log_n, FpExt den_shift)
+// elements for the tiled kernel). Denominators are shifted by den_shift first. real_len <
+// 2^log_n selects the virtual layout: buf then holds only real_len leaves.
+template <bool VIRT>
+int launch_bit_rev_frac_build_k2(FracExt* buf, uint32_t log_n, FpExt den_shift, uint32_t real_len)
 {
     constexpr uint32_t TILE_W = 8;
     constexpr uint32_t tpb = 256;
-    constexpr size_t smem_bytes = (size_t)tpb * TILE_W * sizeof(FracExt);  // 64 KB
+    constexpr size_t smem_bytes = (size_t)tpb * TILE_W * sizeof(FracExt);  // 80 KB
     size_t n_elems = (size_t)1 << log_n;
     if (n_elems < (size_t)(tpb * TILE_W))
         return cudaErrorInvalidValue;
@@ -1595,33 +2039,41 @@ extern "C" int _kb_gkr_bit_rev_frac_ext_build_k2(
     cudaGetDevice(&dev_slot);
     if (dev_slot < 0 || dev_slot >= 16) return cudaErrorInvalidDevice;
     if (vec_path) {
-        // padded rows (TILE_W + 1 per row) -> 72 KB of dynamic shared memory
+        // padded rows (TILE_W + 1 per row) -> 90 KB of dynamic shared memory
         constexpr size_t smem_bytes_vec =
             (size_t)tpb * (TILE_W + 1) * sizeof(FracExt);
         if (!(smem_cap_set[dev_slot].load(std::memory_order_acquire) & 1)) {
             cudaError_t rc = cudaFuncSetAttribute(
-                bit_rev_frac_build_k2_vec_kernel,
+                bit_rev_frac_build_k2_vec_kernel<VIRT>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 (int)smem_bytes_vec);
             if (rc != cudaSuccess) return rc;
             smem_cap_set[dev_slot].fetch_or(1, std::memory_order_release);
         }
-        bit_rev_frac_build_k2_vec_kernel<<<dim3(n_grid), tpb, smem_bytes_vec>>>(
-            buf, log_n, den_shift);
+        bit_rev_frac_build_k2_vec_kernel<VIRT><<<dim3(n_grid), tpb, smem_bytes_vec>>>(
+            buf, log_n, den_shift, real_len);
         return CHECK_KERNEL();
     }
 
     if (!(smem_cap_set[dev_slot].load(std::memory_order_acquire) & 2)) {
         cudaError_t rc = cudaFuncSetAttribute(
-            bit_rev_frac_build_k2_kernel,
+            bit_rev_frac_build_k2_kernel<VIRT>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)smem_bytes);
         if (rc != cudaSuccess) return rc;
         smem_cap_set[dev_slot].fetch_or(2, std::memory_order_release);
     }
-    bit_rev_frac_build_k2_kernel<<<dim3(n_grid), tpb, smem_bytes>>>(
-        buf, log_n, den_shift);
+    bit_rev_frac_build_k2_kernel<VIRT><<<dim3(n_grid), tpb, smem_bytes>>>(
+        buf, log_n, den_shift, real_len);
     return CHECK_KERNEL();
+}
+
+extern "C" int _kb_gkr_bit_rev_frac_ext_build_k2(
+    FracExt* buf, size_t real_len, uint32_t log_n, FpExt den_shift)
+{
+    if (real_len < ((size_t)1 << log_n))
+        return launch_bit_rev_frac_build_k2<true>(buf, log_n, den_shift, (uint32_t)real_len);
+    return launch_bit_rev_frac_build_k2<false>(buf, log_n, den_shift, (uint32_t)real_len);
 }
 
 } // namespace fractional_sumcheck_gkr

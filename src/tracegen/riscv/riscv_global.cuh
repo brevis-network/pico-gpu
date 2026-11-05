@@ -52,6 +52,8 @@ namespace pico_gpu::riscv_global {
     cols.message_0_16bit_limb = F::zero();
     cols.message_0_8bit_limb = F::zero();
     cols.message_0_high_bit = F::zero();
+    cols.message_1_16bit_limb = F::zero();
+    cols.message_1_hi9 = F::zero();
     cols.kind = F::zero();
     cols.is_real = F::zero();
     cols.is_receive = F::zero();
@@ -76,6 +78,9 @@ namespace pico_gpu::riscv_global {
     cols.message_0_8bit_limb = F::from_canonical_u32((event.message[0] >> 16) & 0xFF);
     // 25-bit widening: boolean high bit (no byte lookup), mirrors Rust tracegen.
     cols.message_0_high_bit = F::from_canonical_u32((event.message[0] >> (CHUNK_CLK_BITS - 1)) & 1);
+    // message[1]: 16 + 9 limbs, mirrors Rust tracegen.
+    cols.message_1_16bit_limb = F::from_canonical_u32(event.message[1] & 0xFFFF);
+    cols.message_1_hi9 = F::from_canonical_u32((event.message[1] >> 16) & 0x1FF);
     cols.kind = F::from_canonical_u8(event.kind);
     cols.is_real = F::one();
 
@@ -98,6 +103,8 @@ namespace pico_gpu::riscv_global {
     // Byte lookup events matching CPU extra_record.
     add_u16_range_check<F>(byte_trace, static_cast<uint16_t>(event.message[0] & 0xFFFF));
     add_u16_range_check<F>(byte_trace, static_cast<uint16_t>(event.message[7]));
+    add_u16_range_check<F>(byte_trace, static_cast<uint16_t>(event.message[1] & 0xFFFF));
+    add_bit_range_check<F>(byte_trace, static_cast<uint16_t>((event.message[1] >> 16) & 0x1FF), 9);
     // No kind<32 LTU event: that lookup is gone on the Rust side (constant sender kinds back the
     // bound, and both keygen paths assert it).
     // Offset u8 range check + y6_limbs range checks (mirror eval_single_digest).
@@ -292,7 +299,7 @@ namespace pico_gpu::riscv_global {
     if (blockIdx.x == 0 && threadIdx.x == 0) *out = septic_curve_t::start_point();
   }
 
-  /// TPC_FULL prologue (1 block): build the 54-word dummy-row TEMPLATE on-device. Word c == the
+  /// TPC_FULL prologue (1 block): build the 56-word dummy-row TEMPLATE on-device. Word c == the
   /// value the baseline global_accumulate_kernel leaves at column c of a dummy row (0 for columns
   /// it never writes — those are still 0 from this launcher's own cudaMemsetAsync, and
   /// events_to_trace_with_extra_record_kernel never touches rows >= event_size).
@@ -302,19 +309,19 @@ namespace pico_gpu::riscv_global {
   __global__ void global_accumulate_template_kernel(const septic_curve_t& final_digest, uint32_t* tmpl)
   {
     const int c = threadIdx.x;
-    if (c >= 54) return;
+    if (c >= 56) return;
     const uint32_t* fw = reinterpret_cast<const uint32_t*>(&final_digest);
-    uint32_t v = 0u;                                   // cols 0..11, 12 (offset), 27..32, 33..39 (lambda): zero
+    uint32_t v = 0u;                                   // cols 0..11, 12 (offset), 27..34, 35..41 (lambda): zero
     if (c >= 13 && c <= 19) v = reinterpret_cast<const uint32_t&>(septic_curve_t::dummy_x[c - 13]);
     else if (c >= 20 && c <= 26) v = reinterpret_cast<const uint32_t&>(septic_curve_t::dummy_y[c - 20]);
-    else if (c >= 40 && c <= 53) v = fw[c - 40];       // cum = final_digest
+    else if (c >= 42 && c <= 55) v = fw[c - 42];       // cum = final_digest
     tmpl[c] = v;
   }
 
   /// Thread-per-row lambda witness for the real rows (TPC_FULL companion): lambda needs one septic
   /// inversion per row, so it is not a word copy like the rest of the accumulation cells. Reads
   /// cum = partial_sums[idx] and the row's interaction point (already in the trace) and writes the
-  /// 7 lambda words (columns 33..39); disjoint from the cells the TPC kernel writes.
+  /// 7 lambda words (columns 35..41); disjoint from the cells the TPC kernel writes.
   template <class F>
   __global__ void global_lambda_kernel(
     const septic_curve_t* __restrict__ partial_sums, const size_t event_count, F* trace_matrix, const size_t num_cols)
@@ -335,11 +342,11 @@ namespace pico_gpu::riscv_global {
   }
 
   /// Thread-per-cell accumulation kernel (TPC_FULL): threads [0, real_cells) copy the real
-  /// region — row = t/14, col = 40 + t%14, i.e. the 14 `cum` cells populate_real writes
+  /// region — row = t/14, col = 42 + t%14, i.e. the 14 `cum` cells populate_real writes
   /// (cum = partial_sums[row]; lambda is written by global_lambda_kernel) — so partial_sums
   /// reads coalesce and the 56B/row span stores replace the baseline's 4B-at-216B-stride
   /// dribble. Threads [real_cells, real_cells+dummy_cells) fill the dummy region as ONE
-  /// contiguous coalesced span (all 54 cols incl. the zero cols — byte-equal because the buffer
+  /// contiguous coalesced span (all 56 cols incl. the zero cols — byte-equal because the buffer
   /// arrives zeroed, see the memset argument on the template kernel above) from the smem-cached
   /// template.
   template <class F>
@@ -351,19 +358,19 @@ namespace pico_gpu::riscv_global {
     const uint32_t event_count,
     uint32_t* trace)
   {
-    __shared__ uint32_t s_tmpl[54];
-    if (threadIdx.x < 54) s_tmpl[threadIdx.x] = __ldg(&tmpl[threadIdx.x]);
+    __shared__ uint32_t s_tmpl[56];
+    if (threadIdx.x < 56) s_tmpl[threadIdx.x] = __ldg(&tmpl[threadIdx.x]);
     __syncthreads();
     const uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t < real_cells) {
       const uint32_t row = t / 14u;
       const uint32_t c = t - row * 14u;
-      trace[row * 54u + 40u + c] = __ldg(&ps_words[row * 14u + c]); // cum = partial_sums[row]
+      trace[row * 56u + 42u + c] = __ldg(&ps_words[row * 14u + c]); // cum = partial_sums[row]
     } else {
       const uint32_t t2 = t - real_cells;
       if (t2 >= dummy_cells) return;
-      // dummy region = one contiguous span: word w of the region is column w%54
-      trace[event_count * 54u + t2] = s_tmpl[t2 % 54u];
+      // dummy region = one contiguous span: word w of the region is column w%56
+      trace[event_count * 56u + t2] = s_tmpl[t2 % 56u];
     }
   }
 
@@ -576,14 +583,14 @@ namespace pico_gpu::riscv_global {
       step_begin(steps, step::ACCUMULATE, stream);
 
       // Thread-per-cell fast path: only when the runtime width matches the compile-time
-      // GlobalCols layout the TPC kernels hardcode (54 u32 cols) and the cell indices fit u32
+      // GlobalCols layout the TPC kernels hardcode (56 u32 cols) and the cell indices fit u32
       // arithmetic. Anything else falls back to the original thread-per-row kernel. Both paths
       // must produce byte-identical traces (the fallback is the reference).
       constexpr size_t kGlobalNumCols = sizeof(GlobalCols<F>) / sizeof(F);
-      static_assert(kGlobalNumCols == 54, "riscv_global TPC kernels hardcode the 54-column GlobalCols layout");
-      if (num_cols == kGlobalNumCols && kGlobalNumCols == 54 && sizeof(F) == sizeof(uint32_t) &&
+      static_assert(kGlobalNumCols == 56, "riscv_global TPC kernels hardcode the 56-column GlobalCols layout");
+      if (num_cols == kGlobalNumCols && kGlobalNumCols == 56 && sizeof(F) == sizeof(uint32_t) &&
           trace_size <= 0xFFFFFFFFull) {
-        dev_ptr_t<uint32_t> d_tmpl{54, stream}; // 216B template scratch (freed like d_curve_points)
+        dev_ptr_t<uint32_t> d_tmpl{56, stream}; // 224B template scratch (freed like d_curve_points)
         global_accumulate_template_kernel<F><<<1, 64, 0, stream>>>(
           d_curve_points[event_size], &d_tmpl[0]);
         // lambda (7 words/row) needs a septic inversion per row: thread-per-row, real rows only.
@@ -594,7 +601,7 @@ namespace pico_gpu::riscv_global {
         }
         // cum (14 words/row) + the dummy rows: pure word copies, thread-per-cell.
         const uint32_t real_cells  = (uint32_t)(event_size * 14u);
-        const uint32_t dummy_cells = (uint32_t)((padded_event_size - event_size) * 54u);
+        const uint32_t dummy_cells = (uint32_t)((padded_event_size - event_size) * 56u);
         const uint32_t total_cells = real_cells + dummy_cells;
         const int tpc_block = 512;
         const int tpc_grid = (int)((total_cells + tpc_block - 1) / tpc_block);

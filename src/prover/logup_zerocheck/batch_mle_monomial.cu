@@ -21,18 +21,16 @@
 
 namespace logup_zerocheck_mle {
 
-// Load an FpExt as one 16B vector op (uint4 __ldg) instead of letting the compiler split
-// a plain struct copy into 2x LDG.64. FpExt (kb31_4_t) is only 4-byte aligned per its type
-// layout, so the compiler can't assume 128-bit width on its own. Every FpExt read below
-// indexes a contiguous FpExt[] array at `base + k * sizeof(FpExt)` for an integer k, and the
-// backing allocation is a cudaMalloc'd device buffer (>=16B aligned in practice for any
-// realistically-sized allocation) — so the address is always 16B-aligned regardless of
-// alignof(FpExt). Pure register-reinterpretation after -O3, so this is byte-exact by
-// construction (double-checked by the MLE_VERIFY=1 correctness gate).
+// Load an FpExt through the read-only path (__ldg). FpExt is 20 packed bytes, only 4-byte
+// aligned at odd indices of an FpExt[] array, so it is five 32-bit loads (over KoalaBear^4 it
+// was one uint4 __ldg, every element being 16-byte aligned).
 __device__ __forceinline__ FpExt ldg_fpext(const FpExt *p) {
-    uint4 r = __ldg(reinterpret_cast<const uint4 *>(p));
+    const uint32_t *w = reinterpret_cast<const uint32_t *>(p);
     FpExt out;
-    __builtin_memcpy(&out, &r, sizeof(FpExt));
+#pragma unroll
+    for (uint32_t k = 0; k < FpExt::D; k++) {
+        out.elems[k] = Fp::fromRaw(__ldg(w + k));
+    }
     return out;
 }
 

@@ -24,11 +24,11 @@ when Pico is built with its GPU feature:
 Every source includes the others by its path from `src/` (`"field/fp.h"`, `"tracegen/riscv/cpu.cuh"`),
 so `src/` is the only include root besides the sppark directories.
 
-To build Pico with GPU proving, follow Pico's documentation; the GPU feature is `cuda-mle`, for
+To build Pico with GPU proving, follow Pico's documentation; the GPU feature is `cuda`, for
 example:
 
 ```bash
-cargo build --release --bin mle-single-node --features "cuda-mle bigint-rug tcmalloc mmap-memory"
+cargo build --release --bin mle-single-node --features "cuda bigint-rug tcmalloc mmap-memory"
 ```
 
 GPU targets:
@@ -36,8 +36,8 @@ GPU targets:
 - `cuda-mle` compiles for the compute capability of the first GPU `nvidia-smi` reports, plus PTX.
   Set `CUDA_ARCH` (e.g. `CUDA_ARCH=120`, comma-separated for several) to choose the targets
   yourself, for instance on a build machine without a GPU.
-- `gpu-api` embeds PTX that the driver compiles when the library loads. Set `GPU_TARGET_ARCHS`
-  (e.g. `GPU_TARGET_ARCHS=120`) to compile it ahead of time instead.
+- `gpu-api` embeds PTX that the driver compiles when the library loads. The same `CUDA_ARCH`
+  compiles it for those targets ahead of time instead.
 
 ## Requirements
 
@@ -72,9 +72,9 @@ disclosure instructions.
 pico-gpu builds on prior work in GPU-accelerated zero-knowledge proving:
 
 - [sppark](https://github.com/supranational/sppark): Portions of this library, especially in
-  `third_party/sppark/`, `src/common/` and `src/field/kb31_t.hpp`, are ported and adapted from
-  the sppark project, licensed under the Apache License 2.0 (see
-  [third_party/sppark/LICENSE](third_party/sppark/LICENSE)).
+  `third_party/sppark/`, `src/common/`, `src/field/kb31_t.hpp` and
+  `src/field/koala_bear_quintic.hpp`, are ported and adapted from the sppark project, licensed
+  under the Apache License 2.0 (see [third_party/sppark/LICENSE](third_party/sppark/LICENSE)).
 - [SP1](https://github.com/succinctlabs/sp1): Parts of pico-gpu's trace-generation design are
   inspired by SP1.
 - [Plonky3](https://github.com/Plonky3/Plonky3): pico-gpu's Poseidon2 kernels use Plonky3's
@@ -92,7 +92,7 @@ which keeps its original licence:
 - [sppark](https://github.com/supranational/sppark) (Apache-2.0, see
   [third_party/sppark/LICENSE](third_party/sppark/LICENSE)): `third_party/sppark/`,
   `src/common/device_ptr.hpp`, `src/common/exception.hpp`, `src/common/exception.cuh`,
-  `src/common/rusterror.h` and `src/field/kb31_t.hpp`.
+  `src/common/rusterror.h`, `src/field/kb31_t.hpp` and `src/field/koala_bear_quintic.hpp`.
 - [RISC Zero](https://github.com/risc0/risc0) (Apache-2.0), by way of OpenVM: `src/field/fp.h` and
   `src/field/fpext.h`.
 - [OpenVM stark-backend](https://github.com/openvm-org/stark-backend) (MIT or Apache-2.0,

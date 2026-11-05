@@ -34,8 +34,8 @@ namespace pico_gpu::ext_dot_product {
       for (int k = 0; k < EXTENSION_DEGREE; ++k)
         cols->mus[m]._0[k] = events[idx].mus[m]._0[k];
     for (int g = 0; g < EXT_DOT_PRODUCT_GROUPS; ++g)
-      for (int k = 0; k < EXTENSION_DEGREE; ++k)
-        cols->vals[g]._0[k] = events[idx].vals[g]._0[k];
+      for (int k = 0; k < PACK_LANES; ++k)
+        cols->vals[g][k] = events[idx].vals[g][k];
     for (int k = 0; k < EXTENSION_DEGREE; ++k)
       cols->acc._0[k] = events[idx].acc._0[k];
   }
