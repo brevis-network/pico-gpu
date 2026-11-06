@@ -169,7 +169,7 @@ void mont_modpow(const uint32_t base[N],
 
 // =============================================================================
 // Precomputed Montgomery parameters for each supported curve.
-// R^2 mod p and m0 = -p^(-1) mod 2^32.
+// R^2 mod p and m0 = -p^(-1) mod 2^32, R = 2^(32 N) for an N-word modulus; words little-endian.
 // =============================================================================
 
 namespace mont_params {
@@ -183,15 +183,15 @@ constexpr uint32_t SECP256K1_M0 = 0xd2253531u;
 
 // secp256r1: p = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
 __device__ __constant__ const uint32_t SECP256R1_RR[8] = {
-  0x00000003, 0xfffffffb, 0xfffffffe, 0x00000004,
-  0xfffffffd, 0x00000002, 0x00000001, 0x00000000
+  0x00000003, 0x00000000, 0xffffffff, 0xfffffffb,
+  0xfffffffe, 0xffffffff, 0xfffffffd, 0x00000004
 };
 constexpr uint32_t SECP256R1_M0 = 0x00000001u;
 
 // bn254: p = 0x30644e72e131a029b85045b68181585d97816a916871ca8d3c208c16d87cfd47
 __device__ __constant__ const uint32_t BN254_RR[8] = {
-  0xf32cfc5b, 0xb786686c, 0x006e22d1, 0x64774b84,
-  0x482d9af2, 0xa4a61580, 0x000006c4, 0x0e0a77c1
+  0x538afa89, 0xf32cfc5b, 0xd44501fb, 0xb5e71911,
+  0x0a417ff6, 0x47ab1eff, 0xcab8351f, 0x06d89f71
 };
 constexpr uint32_t BN254_M0 = 0xe4866389u;
 

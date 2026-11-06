@@ -510,6 +510,9 @@ namespace pico_gpu {
     T is_real;
     T is_comp;
     IsZeroOperation<T> is_prev_addr_zero;
+    // 1 / (addr[1] - 0x777f): the address is not in the stack guard. Zero in the guard,
+    // which leaves the row unsatisfiable.
+    T guard_inv;
   };
 
   template <typename T>
@@ -902,8 +905,20 @@ namespace pico_gpu {
     Word<T> op_c_value;
   };
 
-  // Field-for-field mirror of the Rust MemoryChipValueCols (49 columns):
-  // 2 + 2 + 3 + 1 + 10 (lite access) + 7 scalars + 24 (instruction).
+  // A write's check that it misses the program's code, Rust `gadgets/code_range.rs`: either
+  // it ends at or below the code's start, or it starts at or above its end, by a distance proven
+  // non-negative limb by limb.
+  template <class T>
+  struct CodeRangeCols {
+    T code_start[2];
+    T code_end[2];
+    T below;
+    T borrow;
+    T distance[2];
+  };
+
+  // Field-for-field mirror of the Rust MemoryChipValueCols (57 columns):
+  // 2 + 2 + 3 + 1 + 10 (lite access) + 7 scalars + 24 (instruction) + 8 (code range).
   template <typename F>
   struct MemoryChipValueColsU64 {
     F chunk;
@@ -937,6 +952,8 @@ namespace pico_gpu {
     // `store_value` / `unsigned_mem_val` are de-materialized (asserted
     // directly on memory_access.value / op_a on the AIR side).
     MemoryInstructionColsU64<F> instruction;
+    // A store's check that it misses the program's code; zero on a load row.
+    CodeRangeCols<F> code_range;
   };
 
   // ─── End U64 Memory Read/Write column types ────────────────────────
@@ -1238,11 +1255,18 @@ namespace pico_gpu {
     // [pc0 >= 0xFFFC]: the carry out of limb 0 in pc+4, a function of the row's pc. The Program
     // message carries it, pinning every real Cpu row's pc_carry (Rust riscv_program/columns.rs).
     T pc_carry;
+    // The program's code, [pc_base, pc_base + 4 * instructions), each end as two u16 limbs, the
+    // same on every row: what a writing row proves it misses.
+    T code_start[2];
+    T code_end[2];
   };
 
   template <typename T>
   struct ProgramMultCols {
     T multiplicity;
+    // How many writing rows look the code's range up; the host puts the record's count on row 0
+    // (Rust `code_range::code_range_lookups`).
+    T code_range_multiplicity;
   };
 
   struct Poseidon2Event {

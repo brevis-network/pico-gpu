@@ -132,8 +132,10 @@ namespace pico_gpu::keccak {
   static_assert(sizeof(KeccakMemCols<uint32_t>) == NUM_KECCAK_MEM_COLS * sizeof(uint32_t),
     "KeccakMemCols layout drifted from the Rust side (2537 columns)");
 
-  /// One row per permutation event. Mirrors Rust `KeccakControlCols` (`keccak256/control.rs`).
-  /// Uses the `pico_gpu::` gadgets, which carry `populate()`.
+  /// One row per permutation event. Mirrors Rust `KeccakControlCols` (`keccak256/control.rs`) up to
+  /// its last 8 columns, the code range, which `code_range::fill` writes after this chip's
+  /// kernel; the kernel strides rows by the Rust width it is passed. Uses the `pico_gpu::` gadgets,
+  /// which carry `populate()`.
   template <typename T>
   struct KeccakControlCols {
     T chunk;
@@ -147,7 +149,7 @@ namespace pico_gpu::keccak {
 
   constexpr static const uintptr_t NUM_KECCAK_CONTROL_COLS = 534;
   static_assert(sizeof(KeccakControlCols<uint32_t>) == NUM_KECCAK_CONTROL_COLS * sizeof(uint32_t),
-    "KeccakControlCols layout drifted from the Rust side (534 columns)");
+    "KeccakControlCols layout drifted from the Rust side (534 columns before the code range)");
 
   /// Keccak permutation event data (u64 upgrade).
   /// Matches Rust FFIKeccakPermuteEvent layout.
