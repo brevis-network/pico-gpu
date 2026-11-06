@@ -45,8 +45,8 @@ namespace pico_gpu::program_preprocess_u64 {
     // Pin the preprocessed width: this is a raw reinterpret_cast onto the host-allocated row, so
     // any drift between ProgramPreprocessedColsU64 and the Rust ProgramPreprocessedCols writes
     // past (or short of) the row. The Rust side is
-    // `Pc(2) + InstructionCols(9) + OpcodeSelectorCols(13) + pc_carry(1) = 25`.
-    static_assert(sizeof(ProgramPreprocessedColsU64<F>) / sizeof(F) == 25,
+    // `Pc(2) + InstructionCols(9) + OpcodeSelectorCols(13) + pc_carry(1) + code range(4) = 29`.
+    static_assert(sizeof(ProgramPreprocessedColsU64<F>) / sizeof(F) == 29,
                   "ProgramPreprocessedCols width drift vs Rust");
     ProgramPreprocessedColsU64<F>* cols =
       reinterpret_cast<ProgramPreprocessedColsU64<F>*>(&trace_matrix[idx * num_cols]);
@@ -59,6 +59,13 @@ namespace pico_gpu::program_preprocess_u64 {
     // carries row 0's). The Cpu rows write the same [pc0 >= 0xFFFC] (cpu.cuh) and the Program
     // message carries it; the host writes the same value (riscv_program/traces.rs).
     cols->pc_carry = F::from_bool((pc & 0xFFFF) >= 0xFFFC);
+
+    // The program's code, the same on every row, padding and traps included.
+    const uint64_t code_end = pc_base + 4 * static_cast<uint64_t>(count);
+    cols->code_start[0] = F::from_canonical_u16(static_cast<uint16_t>(pc_base & 0xFFFF));
+    cols->code_start[1] = F::from_canonical_u16(static_cast<uint16_t>((pc_base >> 16) & 0xFFFF));
+    cols->code_end[0] = F::from_canonical_u16(static_cast<uint16_t>(code_end & 0xFFFF));
+    cols->code_end[1] = F::from_canonical_u16(static_cast<uint16_t>((code_end >> 16) & 0xFFFF));
 
     // instruction fields
     cols->instruction.opcode = F::from_canonical_u8((uint8_t)inst.opcode);

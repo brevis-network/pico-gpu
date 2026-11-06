@@ -413,6 +413,9 @@ namespace pico_gpu::memory_read_write_history {
     uint32_t count;
     FfiCpuEventU64 event;
     const Row row = cpu_memory_lt_history::memory_row_of(args, rows, idx, idx == 0, count, event);
+    // The code a store proves it misses: the program table's, `[pc_base, pc_base + 4n)`.
+    const uint64_t code_start = args.program.pc_base;
+    const uint64_t code_end = args.program.pc_base + 4 * args.program.count;
     if constexpr (NumCols > 0 && NumCols == sizeof(MemoryChipValueColsU64<F>) / sizeof(F) &&
                   sizeof(F) == sizeof(uint32_t)) {
       extern __shared__ uint32_t wstage_smem[];
@@ -425,7 +428,7 @@ namespace pico_gpu::memory_read_write_history {
       __syncwarp();
       if (row == Row::Event)
         memory_read_write_u64::event_to_row_u64<F>(
-          event, *reinterpret_cast<MemoryChipValueColsU64<F>*>(myrow), byte_trace);
+          event, *reinterpret_cast<MemoryChipValueColsU64<F>*>(myrow), byte_trace, code_start, code_end);
       __syncwarp();
       const size_t warp_base = (size_t)blockIdx.x * blockDim.x + (size_t)warp * 32;
       if (warp_base < count) {
@@ -437,7 +440,8 @@ namespace pico_gpu::memory_read_write_history {
     } else {
       if (row != Row::Event) return;
       memory_read_write_u64::event_to_row_u64<F>(
-        event, *reinterpret_cast<MemoryChipValueColsU64<F>*>(&trace_matrix[idx * num_cols]), byte_trace);
+        event, *reinterpret_cast<MemoryChipValueColsU64<F>*>(&trace_matrix[idx * num_cols]), byte_trace,
+        code_start, code_end);
     }
   }
 
@@ -455,9 +459,10 @@ namespace pico_gpu::memory_read_write_history {
       const size_t rows = trace_size / num_cols;
       if (rows == 0) return RustError{cudaSuccess};
       constexpr size_t kMemRwCols = sizeof(MemoryChipValueColsU64<F>) / sizeof(F);
-      // Pinned: the Rust `NUM_MEMORY_CHIP_VALUE_COLS` asserts the same 49, so a field added or
-      // removed on one side only fails the build instead of shifting every column.
-      static_assert(kMemRwCols == 49, "MemoryChipValueCols width drift vs Rust");
+      // Pinned: the Rust `NUM_MEMORY_CHIP_VALUE_COLS` asserts the same 57 (49 and the code range's 8),
+      // so a field added or removed on one side only fails the build instead of shifting every
+      // column.
+      static_assert(kMemRwCols == 57, "MemoryChipValueCols width drift vs Rust");
       if (num_cols == kMemRwCols) {
         const int block = cpu_memory_lt_history::WSTAGE_BLOCK;
         const size_t shmem = (size_t)(block / 32) * 32 * kMemRwCols * sizeof(F);
