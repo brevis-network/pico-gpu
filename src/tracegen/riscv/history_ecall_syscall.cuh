@@ -30,32 +30,22 @@
 // host too, so they are tested off the device; the kernels and their launchers only under nvcc.
 #pragma once
 
-#include "tracegen/riscv/history.cuh"
+#include "tracegen/riscv/history_launch.cuh"
 
 #if defined(__CUDACC__)
   #include <cub/cub.cuh>
-  #include "common/rusterror.h"
   #include "tracegen/riscv/ecall.cuh"
   #include "tracegen/riscv/syscall.cuh"
 #endif
 
 namespace pico_gpu::ecall_syscall_history {
-  enum class Row : uint32_t {
-    // The thread writes nothing: it lies past the trace, or the fill could not be read and the
-    // error word says why.
-    Nothing,
-    Event,
-    Padding,
-  };
+  using history::Row;
 
-  // Opens the fill and gives the ecall list's length in `count`, or 0 when the fill cannot be read
-  // or the list does not fit the trace's `rows` rows; `reports` names the one thread that reports
-  // the second.
-  REPLAY_HD inline bool open_ecall_list(
-    const history::HistoryArgs& args, size_t rows, bool reports, history::History& h, uint32_t& count)
+  // The ecall list's length in `count`, `h` being the fill opened for the whole history, or 0 when
+  // the list does not fit the trace's `rows` rows; `reports` names the one thread that reports it.
+  REPLAY_HD inline bool ecall_list(const history::History& h, size_t rows, bool reports, uint32_t& count)
   {
     count = 0;
-    if (!history::open(args, history::Readiness::Complete, h)) return false;
     const uint32_t length = history::list_length(h, history::LIST_ECALL);
     if (length > rows) {
       if (reports) history::fail(h.error, history::ERROR_LIST);
@@ -65,39 +55,40 @@ namespace pico_gpu::ecall_syscall_history {
     return true;
   }
 
-  // What thread `idx` of a kernel over the ecall trace's `rows` rows writes: its list row's CPU
-  // event, padding past the list, or nothing.
+  // What thread `idx` of a kernel over the ecall trace's `rows` rows writes, `h` being the fill
+  // opened for the whole history: its list row's CPU event, padding past the list, or nothing. The
+  // row is fetched once, its opcode tested between the fetch's halves; a row whose accesses cannot
+  // be read is the zero event's, the error word failing the chunk.
   REPLAY_HD inline Row ecall_row_of(
-    const history::HistoryArgs& args, size_t rows, size_t idx, bool reports, uint32_t& count, FfiCpuEventU64& event)
+    const history::History& h, size_t rows, size_t idx, bool reports, uint32_t& count, FfiCpuEventU64& event)
   {
-    history::History h;
-    if (!open_ecall_list(args, rows, reports, h, count)) return Row::Nothing;
+    if (!ecall_list(h, rows, reports, count)) return Row::Nothing;
     if (idx >= rows) return Row::Nothing;
     if (idx >= count) return Row::Padding;
-    const uint32_t row = static_cast<uint32_t>(idx);
-    Opcode opcode;
-    if (!history::entry_opcode(h, history::LIST_ECALL, row, opcode)) return Row::Nothing;
-    if (opcode != Opcode::ECALL) {
+    uint32_t index = 0;
+    history::Fetched fetched;
+    if (!history::fetch_entry(h, history::LIST_ECALL, static_cast<uint32_t>(idx), index, fetched)) return Row::Nothing;
+    if (fetched.instruction.opcode != Opcode::ECALL) {
       history::fail(h.error, history::ERROR_LIST);
       return Row::Nothing;
     }
-    event = history::ecall_event(h, row);
+    event = history::fetch_accesses(h, index, fetched) ? history::cpu_event_of(h, fetched) : FfiCpuEventU64{};
     return Row::Event;
   }
 
   // The rows the tally scan runs over: the ecall list's, or none when the event kernel wrote none.
-  REPLAY_HD inline uint32_t ecall_rows(const history::HistoryArgs& args, size_t rows)
+  REPLAY_HD inline uint32_t ecall_rows(const history::History& h, size_t rows)
   {
-    history::History h;
     uint32_t count;
-    open_ecall_list(args, rows, false, h, count);
+    ecall_list(h, rows, false, count);
     return count;
   }
 
-  // What thread `idx` of a kernel over the syscall trace's `rows` rows writes, its global event
-  // going to slot `idx` of the `global_slots` the host reserved.
+  // What thread `idx` of a kernel over the syscall trace's `rows` rows writes, `h` being the fill
+  // opened for the whole history, its global event going to slot `idx` of the `global_slots` the
+  // host reserved.
   REPLAY_HD inline Row syscall_row_of(
-    const history::HistoryArgs& args,
+    const history::History& h,
     size_t rows,
     size_t global_slots,
     size_t idx,
@@ -106,8 +97,6 @@ namespace pico_gpu::ecall_syscall_history {
     SyscallEventU64& event)
   {
     count = 0;
-    history::History h;
-    if (!history::open(args, history::Readiness::Complete, h)) return Row::Nothing;
     const uint32_t length = h.syscall_count;
     if (length > rows || length != global_slots) {
       if (reports) history::fail(h.error, history::ERROR_SYSCALL);
@@ -125,11 +114,6 @@ namespace pico_gpu::ecall_syscall_history {
 
 namespace pico_gpu::ecall_syscall_history {
   constexpr int BLOCK_SIZE = 256;
-
-  inline unsigned int grid_for(size_t rows, int block_size)
-  {
-    return static_cast<unsigned int>((rows + block_size - 1) / block_size);
-  }
 } // namespace pico_gpu::ecall_syscall_history
 
 namespace pico_gpu::ecall_history {
@@ -140,9 +124,10 @@ namespace pico_gpu::ecall_history {
     const history::HistoryArgs args, const size_t rows, F* trace_matrix, const size_t num_cols, F* byte_trace)
   {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
     uint32_t count;
     FfiCpuEventU64 event;
-    if (ecall_syscall_history::ecall_row_of(args, rows, idx, idx == 0, count, event) != Row::Event) return;
+    if (!h || ecall_syscall_history::ecall_row_of(*h, rows, idx, idx == 0, count, event) != Row::Event) return;
     EcallChipColsU64<F>* cols = reinterpret_cast<EcallChipColsU64<F>*>(&trace_matrix[idx * num_cols]);
     ecall_u64::event_to_row<F>(event, *cols, byte_trace);
   }
@@ -159,7 +144,8 @@ namespace pico_gpu::ecall_history {
     typedef cub::BlockScan<Tally, ecall_u64::COMMIT_TALLY_BLOCK> BlockScan;
     __shared__ typename BlockScan::TempStorage temp_storage;
     __shared__ Tally carry;
-    const size_t count = ecall_syscall_history::ecall_rows(args, rows);
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
+    const size_t count = h ? ecall_syscall_history::ecall_rows(*h, rows) : 0;
     if (threadIdx.x == 0) carry = Tally{F::zero(), F::zero()};
     __syncthreads();
 
@@ -182,14 +168,16 @@ namespace pico_gpu::ecall_history {
     }
   }
 
-  // The rows past the list take the last list row's sums; with no list row they stay zero.
+  // The rows past the list take the last list row's sums; with no list row they stay zero. The fill
+  // is opened before any thread returns: every thread of the block reaches the opening's barrier.
   template <class F>
   __global__ void commit_tally_fill_kernel(
     const history::HistoryArgs args, const size_t rows, F* trace, const size_t num_cols)
   {
     const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows) return;
-    const size_t count = ecall_syscall_history::ecall_rows(args, rows);
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
+    if (row >= rows || !h) return;
+    const size_t count = ecall_syscall_history::ecall_rows(*h, rows);
     if (count == 0 || row < count) return;
     const EcallChipColsU64<F>* last = reinterpret_cast<const EcallChipColsU64<F>*>(&trace[(count - 1) * num_cols]);
     EcallChipColsU64<F>* cols = reinterpret_cast<EcallChipColsU64<F>*>(&trace[row * num_cols]);
@@ -206,30 +194,26 @@ namespace pico_gpu::ecall_history {
     F* byte_trace,
     cudaStream_t stream)
   {
-    try {
-      // The mirrored struct must stay field-for-field with the Rust `#[repr(C)]` `EcallChipCols`: a
-      // width that disagrees means the two have drifted, and writing at this struct's offsets would
-      // fill the wrong columns, so it is refused.
-      constexpr size_t NUM_ECALL_CHIP_COLS = sizeof(EcallChipColsU64<F>) / sizeof(F);
-      if (num_cols != NUM_ECALL_CHIP_COLS) return RustError{cudaErrorInvalidValue};
+    // The mirrored struct must stay field-for-field with the Rust `#[repr(C)]` `EcallChipCols`: a
+    // width that disagrees means the two have drifted, and writing at this struct's offsets would
+    // fill the wrong columns, so it is refused.
+    constexpr size_t NUM_ECALL_CHIP_COLS = sizeof(EcallChipColsU64<F>) / sizeof(F);
+    if (num_cols != NUM_ECALL_CHIP_COLS) return RustError{cudaErrorInvalidValue};
 
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+    return history::launch_zeroed(trace, trace_size, stream, [&] {
       const size_t rows = trace_size / num_cols;
-      const unsigned int grid = ecall_syscall_history::grid_for(rows, ecall_syscall_history::BLOCK_SIZE);
+      history::refuse_no_rows(rows);
+      const unsigned int grid = history::grid_for(rows, ecall_syscall_history::BLOCK_SIZE);
       ecall_history_to_trace_kernel<F>
         <<<grid, ecall_syscall_history::BLOCK_SIZE, 0, stream>>>(args, rows, trace, num_cols, byte_trace);
-      CUDA_OK(cudaGetLastError());
+      history::check_launch();
       commit_tally_scan_kernel<F>
         <<<1, ecall_u64::COMMIT_TALLY_BLOCK, 0, stream>>>(args, rows, trace, num_cols);
-      CUDA_OK(cudaGetLastError());
+      history::check_launch();
       commit_tally_fill_kernel<F>
         <<<grid, ecall_syscall_history::BLOCK_SIZE, 0, stream>>>(args, rows, trace, num_cols);
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-
-    return RustError{cudaSuccess};
+      history::check_launch();
+    });
   }
 } // namespace pico_gpu::ecall_history
 
@@ -249,9 +233,10 @@ namespace pico_gpu::syscall_history {
     F* byte_trace)
   {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
     uint32_t count;
     SyscallEventU64 event;
-    if (ecall_syscall_history::syscall_row_of(args, rows, global_slots, idx, idx == 0, count, event) != Row::Event)
+    if (!h || ecall_syscall_history::syscall_row_of(*h, rows, global_slots, idx, idx == 0, count, event) != Row::Event)
       return;
     SyscallColsU64<F>* cols = reinterpret_cast<SyscallColsU64<F>*>(&trace_matrix[idx * num_cols]);
     syscall_u64::event_to_row(event, cols, &reserved[idx], false, byte_trace);
@@ -269,26 +254,21 @@ namespace pico_gpu::syscall_history {
     const size_t global_slots,
     cudaStream_t stream)
   {
-    try {
-      // A width other than the mirrored struct's means the two have drifted.
-      if (num_cols != sizeof(SyscallColsU64<F>) / sizeof(F)) return RustError{cudaErrorInvalidValue};
-      // No slot to write may come with no buffer to write it in.
-      if (global_slots > 0 && global_events == nullptr) return RustError{cudaErrorInvalidValue};
+    // A width other than the mirrored struct's means the two have drifted.
+    if (num_cols != sizeof(SyscallColsU64<F>) / sizeof(F)) return RustError{cudaErrorInvalidValue};
+    // No slot to write may come with no buffer to write it in.
+    if (global_slots > 0 && global_events == nullptr) return RustError{cudaErrorInvalidValue};
 
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+    return history::launch_zeroed(trace, trace_size, stream, [&] {
       const size_t rows = trace_size / num_cols;
+      history::refuse_no_rows(rows);
       GlobalInteractionEvent* reserved =
         global_events == nullptr ? nullptr : &global_events[global_events_start_index];
       syscall_history_to_trace_kernel<F>
-        <<<ecall_syscall_history::grid_for(rows, ecall_syscall_history::BLOCK_SIZE),
-           ecall_syscall_history::BLOCK_SIZE, 0, stream>>>(
+        <<<history::grid_for(rows, ecall_syscall_history::BLOCK_SIZE), ecall_syscall_history::BLOCK_SIZE, 0, stream>>>(
           args, rows, trace, num_cols, reserved, global_slots, byte_trace);
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-
-    return RustError{cudaSuccess};
+      history::check_launch();
+    });
   }
 } // namespace pico_gpu::syscall_history
 

@@ -176,6 +176,55 @@ namespace pico_gpu::history_check {
     return true;
   }
 
+  // The ALU event of row `row` of the ALU list `list`, or the zero event when the row cannot be
+  // fetched.
+  template <history::ExceptionLookup Lookup = history::DEFAULT_EXCEPTION_LOOKUP>
+  REPLAY_HD inline AluEventU64 alu_event(const history::History& h, uint32_t list, uint32_t row)
+  {
+    uint32_t index = 0;
+    history::Fetched fetched;
+    if (!history::entry_at(h, list, row, index) || !history::fetch<Lookup>(h, index, fetched)) return AluEventU64{};
+    return history::alu_event_of(fetched);
+  }
+
+  // Row `row` of the less-than chip: its own list's steps, then one comparison per branch step.
+  template <history::ExceptionLookup Lookup = history::DEFAULT_EXCEPTION_LOOKUP>
+  REPLAY_HD inline AluEventU64 compare_event(const history::History& h, uint32_t row)
+  {
+    const uint32_t own = history::list_length(h, history::LIST_LT);
+    if (row < own) return alu_event<Lookup>(h, history::LIST_LT, row);
+    uint32_t index = 0;
+    history::Fetched fetched;
+    if (!history::entry_at(h, history::LIST_BRANCH, row - own, index) || !history::fetch<Lookup>(h, index, fetched))
+      return AluEventU64{};
+    return history::compare_event_of(fetched);
+  }
+
+  REPLAY_HD inline bool same_access(const history::Access& x, const history::Access& y)
+  {
+    return x.value == y.value && x.prev_value == y.prev_value && x.prev_chunk == y.prev_chunk &&
+           x.prev_timestamp == y.prev_timestamp;
+  }
+
+  // Whether `skipped`, fetched with the memory slot skipped, is `loaded` but for that slot's
+  // access, which it must hold as zero.
+  REPLAY_HD inline bool same_but_memory(const history::Fetched& skipped, const history::Fetched& loaded)
+  {
+    const history::Step &s = skipped.step, &l = loaded.step;
+    const InstructionU64 &si = skipped.instruction, &li = loaded.instruction;
+    bool same = s.clk == l.clk && s.pc == l.pc && s.next_pc == l.next_pc && s.first_read == l.first_read &&
+                s.first_write == l.first_write && si.opcode == li.opcode && si.op_a == li.op_a && si.op_b == li.op_b &&
+                si.op_c == li.op_c && si.imm_b == li.imm_b && si.imm_c == li.imm_c &&
+                skipped.accesses.slots.present == loaded.accesses.slots.present &&
+                skipped.accesses.slots.written == loaded.accesses.slots.written &&
+                skipped.operands.a == loaded.operands.a && skipped.operands.b == loaded.operands.b &&
+                skipped.operands.c == loaded.operands.c &&
+                same_access(skipped.accesses.at[history::MEMORY], history::Access{});
+    for (uint32_t position = history::SLOT_C; position <= history::SLOT_A; ++position)
+      same = same && same_access(skipped.accesses.at[position], loaded.accesses.at[position]);
+    return same;
+  }
+
   REPLAY_HD inline bool same_record(const FfiOption<MemoryRecordEnumU64>& option, const RecordRow& row)
   {
     if (option.tag == FfiOption<MemoryRecordEnumU64>::Tag::None) return row.kind == 0;
@@ -228,8 +277,14 @@ namespace pico_gpu::history_check {
   {
     const void* rows = expected.rows[stream];
     switch (stream) {
-    case STREAM_CPU:
-      return same_cpu(history::cpu_event<Lookup>(h, row), static_cast<const CpuRow*>(rows)[row]);
+    case STREAM_CPU: {
+      // The CPU kernel's own fetch, which skips the memory slot, must read the full fetch's row but
+      // for that slot, and the full fetch's event must be the dump's.
+      history::Fetched skipped, loaded;
+      return history::fetch<Lookup, history::MemorySlot::Skip>(h, row, skipped) &&
+             history::fetch<Lookup>(h, row, loaded) && same_but_memory(skipped, loaded) &&
+             same_cpu(history::cpu_event_of(h, loaded), static_cast<const CpuRow*>(rows)[row]);
+    }
     case STREAM_MEMORY: {
       uint32_t step = 0;
       return history::entry_at(h, history::LIST_MEMORY, row, step) &&
@@ -238,16 +293,16 @@ namespace pico_gpu::history_check {
     case STREAM_ADD_SUB: {
       uint32_t list = 0, at = 0;
       return merged_entry(h, history::LIST_ADD, history::LIST_SUB, row, list, at) &&
-             same_alu(history::alu_event<Lookup>(h, list, at), static_cast<const AluRow*>(rows)[row]);
+             same_alu(alu_event<Lookup>(h, list, at), static_cast<const AluRow*>(rows)[row]);
     }
     case STREAM_SYSCALL:
       return same_syscall(history::syscall_event(h, row), static_cast<const SyscallEventU64*>(rows)[row]);
     case STREAM_BRANCH_COMPARE:
       return same_alu(
-        history::compare_event<Lookup>(h, history::list_length(h, history::LIST_LT) + row),
+        compare_event<Lookup>(h, history::list_length(h, history::LIST_LT) + row),
         static_cast<const AluRow*>(rows)[row]);
     default:
-      return same_alu(history::alu_event<Lookup>(h, list_of(stream), row), static_cast<const AluRow*>(rows)[row]);
+      return same_alu(alu_event<Lookup>(h, list_of(stream), row), static_cast<const AluRow*>(rows)[row]);
     }
   }
 

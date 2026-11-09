@@ -12,7 +12,9 @@
 #include <memory>
 #include <vector>
 
-#include "tracegen/riscv/history.cuh"
+#include "tracegen/riscv/history_check.cuh"
+#include "tracegen/riscv/history_cpu_memory_lt.cuh"
+#include "tracegen/riscv/history_ecall_syscall.cuh"
 
 using namespace pico_gpu;
 using namespace pico_gpu::history;
@@ -111,6 +113,95 @@ namespace {
 
   FillDescriptor& descriptor_of(std::vector<uint64_t>& fill) { return *reinterpret_cast<FillDescriptor*>(fill.data()); }
 
+  bool same_record(const FfiOption<MemoryRecordEnumU64>& x, const FfiOption<MemoryRecordEnumU64>& y)
+  {
+    if (x.tag != y.tag) return false;
+    if (x.tag == FfiOption<MemoryRecordEnumU64>::Tag::None) return true;
+    const MemoryRecordEnumU64 &r = x.some._0, &q = y.some._0;
+    if (r.tag != q.tag) return false;
+    if (r.tag == MemoryRecordEnumU64::Tag::Read) {
+      const MemoryReadRecordU64 &a = r.read._0, &b = q.read._0;
+      return a.value == b.value && a.chunk == b.chunk && a.timestamp == b.timestamp && a.prev_chunk == b.prev_chunk &&
+             a.prev_timestamp == b.prev_timestamp;
+    }
+    const MemoryWriteRecordU64 &a = r.write._0, &b = q.write._0;
+    return a.value == b.value && a.chunk == b.chunk && a.timestamp == b.timestamp && a.prev_value == b.prev_value &&
+           a.prev_chunk == b.prev_chunk && a.prev_timestamp == b.prev_timestamp;
+  }
+
+  // Whether two CPU events agree on all but their memory record and memory value.
+  bool same_cpu_registers(const FfiCpuEventU64& x, const FfiCpuEventU64& y)
+  {
+    const InstructionU64 &xi = x.instruction, &yi = y.instruction;
+    return x.chunk == y.chunk && x.clk == y.clk && x.pc == y.pc && x.next_pc == y.next_pc && xi.opcode == yi.opcode &&
+           xi.op_a == yi.op_a && xi.op_b == yi.op_b && xi.op_c == yi.op_c && xi.imm_b == yi.imm_b &&
+           xi.imm_c == yi.imm_c && x.a == y.a && x.b == y.b && x.c == y.c && same_record(x.a_record, y.a_record) &&
+           same_record(x.b_record, y.b_record) && same_record(x.c_record, y.c_record) && x.exit_code == y.exit_code;
+  }
+
+  bool same_cpu(const FfiCpuEventU64& x, const FfiCpuEventU64& y)
+  {
+    return same_cpu_registers(x, y) && same_record(x.memory_record, y.memory_record) && x.memory.tag == y.memory.tag &&
+           (x.memory.tag == FfiOption<uint64_t>::Tag::None || x.memory.some._0 == y.memory.some._0);
+  }
+
+  bool same_alu(const AluEventU64& x, const AluEventU64& y)
+  {
+    return x.clk == y.clk && x.opcode == y.opcode && x.a == y.a && x.b == y.b && x.c == y.c && x.is_imm == y.is_imm &&
+           x.is_cmp == y.is_cmp;
+  }
+
+  // The list chips' row functions on the intact fill, its first memory-list row pointed at the ADD
+  // step when `misfiled`, whose accesses are then broken too: the error word, or ~0 when a row's
+  // event is not the one its step rebuilds, or a row is not of the kind expected.
+  uint32_t list_rows(bool misfiled)
+  {
+    std::vector<uint64_t> fill = intact_fill();
+    FillDescriptor& d = descriptor_of(fill);
+    if (misfiled) {
+      uint8_t* bytes = reinterpret_cast<uint8_t*>(fill.data());
+      reinterpret_cast<uint32_t*>(bytes + d.entries_at)[d.list_start[LIST_MEMORY]] = 0;
+      // A write row past the next step's first: reading the step's accesses would set the write bit.
+      reinterpret_cast<Step*>(bytes + d.steps_at)[0].first_write = 2;
+    }
+    uint32_t error = 0;
+    HistoryArgs args = {};
+    args.fill = reinterpret_cast<const uint8_t*>(fill.data());
+    args.fill_bytes = d.buffer_bytes;
+    args.expected = d.identity;
+    args.program = ProgramTable{PROGRAM.data(), PROGRAM.size(), PC_BASE, PROGRAM_KEY};
+    args.error = &error;
+    History h;
+    if (!open(args, Readiness::Complete, h)) return error;
+    bool held = true;
+    const uint32_t rows = 4;
+    for (uint32_t row = 0; row < rows; ++row) {
+      uint32_t count = 0, step = 0;
+      FfiCpuEventU64 event = {};
+      const Row memory = cpu_memory_lt_history::memory_row_of(h, rows, row, row == 0, count, event);
+      if (row >= count)
+        held = held && memory == Row::Padding;
+      else if (misfiled && row == 0)
+        held = held && memory == Row::Nothing;
+      else
+        held =
+          held && memory == Row::Event && entry_at(h, LIST_MEMORY, row, step) && same_cpu(event, cpu_event(h, step));
+      event = {};
+      const Row ecall = ecall_syscall_history::ecall_row_of(h, rows, row, row == 0, count, event);
+      if (row >= count)
+        held = held && ecall == Row::Padding;
+      else
+        held = held && ecall == Row::Event && entry_at(h, LIST_ECALL, row, step) && same_cpu(event, cpu_event(h, step));
+      AluEventU64 compare = {};
+      const Row lt = cpu_memory_lt_history::lt_row_of(h, rows, row, row == 0, count, compare);
+      if (row >= count)
+        held = held && lt == Row::Padding;
+      else
+        held = held && lt == Row::Event && same_alu(compare, history_check::compare_event(h, row));
+    }
+    return held ? error : ~0u;
+  }
+
   struct Case {
     const char* name;
     // Breaks the fill, and the launch arguments' identity and allocation size where the case is
@@ -152,11 +243,16 @@ namespace {
       for (uint32_t step = 0; step < h.step_count; ++step) {
         cpu_event<ExceptionLookup::Search>(h, step);
         cpu_event<ExceptionLookup::Bitmap>(indexed, step);
+        Fetched fetched;
+        fetch<ExceptionLookup::Search, MemorySlot::Skip>(h, step, fetched);
+        fetch<ExceptionLookup::Bitmap, MemorySlot::Skip>(indexed, step, fetched);
       }
-      for (uint32_t row = 0; row < list_length(h, LIST_MEMORY); ++row)
-        memory_event(h, row);
+      for (uint32_t row = 0; row < list_length(h, LIST_MEMORY); ++row) {
+        uint32_t index = 0;
+        if (entry_at(h, LIST_MEMORY, row, index)) cpu_event(h, index);
+      }
       for (uint32_t row = 0; row < list_length(h, LIST_BRANCH); ++row)
-        compare_event(h, list_length(h, LIST_LT) + row);
+        history_check::compare_event(h, list_length(h, LIST_LT) + row);
       for (uint32_t row = 0; row < h.syscall_count; ++row)
         syscall_event(h, row);
     }
@@ -267,6 +363,70 @@ int main()
     passed = passed && same;
     std::printf(
       "  %-55s error word %#06x, expected %#06x%s\n", "bitmap word past the index", error, ERROR_EXCEPTION,
+      same ? "" : "  FAIL");
+  }
+  {
+    // A fetch skipping the memory slot skips nothing else: on every step of the intact fill, the
+    // loads and stores among them, it reads what the full fetch reads but that access.
+    std::vector<uint64_t> fill = intact_fill();
+    uint32_t error = 0;
+    HistoryArgs args = {};
+    args.fill = reinterpret_cast<const uint8_t*>(fill.data());
+    args.fill_bytes = descriptor_of(fill).buffer_bytes;
+    args.expected = descriptor_of(fill).identity;
+    args.program = ProgramTable{PROGRAM.data(), PROGRAM.size(), PC_BASE, PROGRAM_KEY};
+    args.error = &error;
+    History h;
+    bool same = open(args, Readiness::Complete, h);
+    uint32_t memory_steps = 0;
+    for (uint32_t step = 0; same && step < h.step_count; ++step) {
+      Fetched skipped, loaded;
+      same =
+        fetch<ExceptionLookup::Search, MemorySlot::Skip>(h, step, skipped) &&
+        fetch<ExceptionLookup::Search>(h, step, loaded) && history_check::same_but_memory(skipped, loaded);
+      memory_steps += loaded.accesses.slots.contains(MEMORY);
+    }
+    same = same && error == 0 && memory_steps == 2;
+    passed = passed && same;
+    std::printf(
+      "  %-55s error word %#06x, expected %#06x%s\n", "a fetch skipping the memory slot", error, 0u,
+      same ? "" : "  FAIL");
+  }
+  for (const bool misfiled : {false, true}) {
+    // A list chip fetches a row once and tests its opcode before reading its accesses: a misfiled
+    // row sets the list bit alone.
+    const uint32_t error = list_rows(misfiled), expected = misfiled ? uint32_t(ERROR_LIST) : 0u;
+    const bool same = error == expected;
+    passed = passed && same;
+    std::printf(
+      "  %-55s error word %#06x, expected %#06x%s\n",
+      misfiled ? "list rows, a memory row naming the ADD step" : "list rows from one fetch", error, expected,
+      same ? "" : "  FAIL");
+  }
+  {
+    // A trace of no rows: the memory, less-than and CPU padding kernels still run over it, and the
+    // memory list and the steps it cannot hold set their bits of the error word, never dropped.
+    std::vector<uint64_t> fill = intact_fill();
+    uint32_t error = 0;
+    HistoryArgs args = {};
+    args.fill = reinterpret_cast<const uint8_t*>(fill.data());
+    args.fill_bytes = descriptor_of(fill).buffer_bytes;
+    args.expected = descriptor_of(fill).identity;
+    args.program = ProgramTable{PROGRAM.data(), PROGRAM.size(), PC_BASE, PROGRAM_KEY};
+    args.error = &error;
+    History h;
+    bool same = open(args, Readiness::Complete, h) && list_length(h, LIST_MEMORY) > 0 && h.step_count > 0;
+    uint32_t memory_count = 1, lt_count = 1;
+    FfiCpuEventU64 event = {};
+    AluEventU64 compare = {};
+    same = same && cpu_memory_lt_history::memory_row_of(h, 0, 0, true, memory_count, event) == Row::Nothing &&
+           memory_count == 0 && cpu_memory_lt_history::lt_row_of(h, 0, 0, true, lt_count, compare) == Row::Nothing &&
+           lt_count == 0 && cpu_memory_lt_history::cpu_pad_row_of(h, 0, 0, true) == Row::Nothing;
+    const uint32_t expected = uint32_t(ERROR_LIST) | uint32_t(ERROR_STEP);
+    same = same && error == expected;
+    passed = passed && same;
+    std::printf(
+      "  %-55s error word %#06x, expected %#06x%s\n", "a trace of no rows under a non-empty fill", error, expected,
       same ? "" : "  FAIL");
   }
   for (const Case& c : cases) {
