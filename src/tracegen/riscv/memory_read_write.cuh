@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <iostream>
 #include "common/rusterror.h"
+#include "tracegen/common/code_range.cuh"
 #include "tracegen/common/field_word_range_checker.cuh"
 #include "tracegen/common/prelude.cuh"
 #include "tracegen/common/utils.cuh"
@@ -318,11 +319,15 @@ namespace pico_gpu::memory_read_write_u64 {
     }
   }
 
+  // `code_start` and `code_end` are the program's code, `[pc_base, pc_base + 4 * instructions)`,
+  // which a store proves it misses.
   template <class F>
   __device__ void event_to_row_u64(
     const FfiCpuEventU64& event,
     MemoryChipValueColsU64<F>& col,
-    F* byte_trace)
+    F* byte_trace,
+    const uint64_t code_start,
+    const uint64_t code_end)
   {
     col.chunk = F::from_canonical_u32(event.chunk);
     col.clk = F::from_canonical_u32(static_cast<uint32_t>(event.clk));
@@ -333,6 +338,13 @@ namespace pico_gpu::memory_read_write_u64 {
 
     mem_inst_populate_u64(col.instruction, event, byte_trace);
     populate_memory_u64(col, event, byte_trace);
+
+    // A store's check that it misses the code (Rust `code_range_to_row`); a load leaves the
+    // columns zero.
+    const uint64_t width = code_range::store_width(event.instruction.opcode);
+    if (width != 0) {
+      code_range::populate<F>(col.code_range, event.b + event.c, width, code_start, code_end, byte_trace);
+    }
   }
 } // namespace pico_gpu::memory_read_write_u64
 

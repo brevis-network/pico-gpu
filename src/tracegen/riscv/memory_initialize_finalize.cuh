@@ -101,6 +101,10 @@ namespace pico_gpu::memory_initialize_finalize_u64 {
     cols->addr[0] = F::from_canonical_u16(static_cast<uint16_t>(addr & 0xFFFF));
     cols->addr[1] = F::from_canonical_u16(static_cast<uint16_t>((addr >> 16) & 0xFFFF));
     cols->addr[2] = F::from_canonical_u16(static_cast<uint16_t>((addr >> 32) & 0xFFFF));
+    // Not in the stack guard, `addr[1] != 0x777f`: no inverse there, and zero leaves the row
+    // unsatisfiable, as on the host.
+    const F guard = cols->addr[1] - F::from_canonical_u16(0x777f);
+    cols->guard_inv = guard.is_zero() ? F::zero() : guard.reciprocal();
 
     cols->chunk = F::from_canonical_u32(event->chunk);
     cols->timestamp = F::from_canonical_u32(event->timestamp);
@@ -150,6 +154,8 @@ namespace pico_gpu::memory_initialize_finalize_u64 {
     // Byte lookups: addr u16 range checks
     for (int i = 0; i < 3; ++i)
       add_u16_range_check<F>(byte_trace, static_cast<uint16_t>(addr >> (16 * i)));
+    // Below the top of memory, 0x7800_0000: wraps, and so fails the lookup, above it.
+    add_u16_range_check<F>(byte_trace, static_cast<uint16_t>(0x77ff - static_cast<uint16_t>(addr >> 16)));
 
     // Byte lookups: prev_addr u16 range checks
     for (int i = 0; i < 3; ++i)
