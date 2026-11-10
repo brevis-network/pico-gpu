@@ -13,9 +13,7 @@
 #include "tracegen/common/utils.cuh"
 #include "tracegen/riscv/byte.cuh"
 #include "tracegen/riscv/divrem.cuh"
-// Used directly by the ecall populate below. It used to arrive through
-// field_word_range_checker.cuh, which no longer needs it.
-#include "tracegen/common/is_zero.cuh"
+#include "tracegen/riscv/history.cuh"
 
 
 // ─── U64 CPU chip ──────────────────────────────────────────────────────
@@ -30,20 +28,6 @@ namespace pico_gpu::cpu_u64 {
   {
     pc._0[0] = F::from_canonical_u16(static_cast<uint16_t>(value & 0xFFFF));
     pc._0[1] = F::from_canonical_u16(static_cast<uint16_t>((value >> 16) & 0xFFFF));
-  }
-
-  template <class F>
-  __device__ inline void populate_chunk_clk(const FfiCpuEventU64& event, CpuColsU64<F>& cols)
-  {
-    // No chunk column to fill: the AIR's messages carry the `execution_chunk` public value.
-    const uint32_t compat_clk = static_cast<uint32_t>(event.clk);
-
-    // One `clk` column, mirrors Rust populate_chunk_clk. The Rust side asserts clk < 2^25 (the
-    // chunk-split budget); this side does not check.
-    cols.clk = F::from_canonical_u32(compat_clk);
-
-    // No byte event for clk: no such lookup exists on the Rust side (clk is bounded by the row
-    // chain -- riscv_cpu/chunk_clk). Emitting one here would unbalance the multiset.
   }
 
   template <class F>
@@ -119,188 +103,111 @@ namespace pico_gpu::cpu_u64 {
   }
 
   template <class F>
-  __device__ inline void populate_read_write_cols_u64(
-    MemoryReadWriteLiteCols<F>& col, const MemoryRecordEnumU64& record,
-    F* byte_trace)
-  {
-    if (record.tag == MemoryRecordEnumU64::Tag::Write) {
-      write_word_from_u64(col.prev_value, record.write._0.prev_value);
-    } else {
-      write_word_from_u64(col.prev_value, record.read._0.value);
-    }
-    populate_memory_access_u64<F>(
-      col.access, record.value(), record.chunk(), record.timestamp(),
-      record.prev_chunk(), record.prev_timestamp(),
-      byte_trace);
-  }
-
-  template <class F>
-  __device__ inline void populate_read_cols_u64(
-    MemoryReadLiteCols<F>& col, const MemoryReadRecordU64& record,
-    F* byte_trace)
-  {
-    populate_memory_access_u64<F>(
-      col.access, record.value, record.chunk, record.timestamp,
-      record.prev_chunk, record.prev_timestamp,
-      byte_trace);
-  }
-
-  template <class F>
-  __device__ inline void populate_branch(
-    const FfiCpuEventU64& event, CpuColsU64<F>& cols,
-    AluEventU64* alu_lt_events, size_t& alu_lt_index)
-  {
-    if (instruction::is_branch_instruction_u64(event.instruction)) {
-      const bool use_signed_comparison =
-        event.instruction.opcode == Opcode::BLT || event.instruction.opcode == Opcode::BGE;
-
-      bool a_lt_b, a_gt_b;
-      if (use_signed_comparison) {
-        a_lt_b = (int64_t)event.a < (int64_t)event.b;
-        a_gt_b = (int64_t)event.a > (int64_t)event.b;
-      } else {
-        a_lt_b = event.a < event.b;
-        a_gt_b = event.a > event.b;
-      }
-
-      const Opcode alu_op_code = use_signed_comparison ? Opcode::SLT : Opcode::SLTU;
-
-      // One merged comparison event (mirrors Rust `populate_branch`): the Lt row pins both bits,
-      // `a[0] = a_lt_b`, `a[1] = a_gt_b`. One lt slot per branch -- must stay in step with the
-      // Rust `count_cpu_event`.
-      AluEventU64 cmp_event = {};
-      cmp_event.clk = event.clk;
-      cmp_event.opcode = alu_op_code;
-      cmp_event.a = (a_lt_b ? 1ULL : 0ULL) | ((a_gt_b ? 1ULL : 0ULL) << 16);
-      cmp_event.b = event.a;
-      cmp_event.c = event.b;
-      cmp_event.is_cmp = true;
-      alu_lt_events[alu_lt_index++] = cmp_event;
-
-      // `a_eq_b` is derived in the constraints (1 - a_lt_b - a_gt_b); no column, and neither is
-      // the taken predicate any more -- the AIR builds it from these two bits and the opcode
-      // selectors (`CpuChip::branch_taken_expr`). The column that held it is now `is_last`, which
-      // the host writes. A taken branch emits no ADD event either: the AIR proves
-      // `next_pc = pc + c` with one field equation over the sign-extended offset instead of
-      // dispatching to the Add chip, and emitting one here would unbalance the ALU bus.
-      cols.a_lt_b = F::from_bool(a_lt_b);
-      cols.a_gt_b = F::from_bool(a_gt_b);
-    }
-  }
-
-  // No populate_jump and no ADD event from any Cpu row: a JAL target is a field equation and a
-  // JALR target is proven in-chip by four boolean carry expressions (Rust jump/constraints.rs).
-  // No populate_auipc either: since X12 the transpiler re-encodes `AUIPC rd, imm` as the
-  // two-immediate `ADD rd, imm, pc`, so that row's Add event arrives through the emulator's
-  // generic ALU path. The host `count_cpu_event` reserves no ADD slot (`.add` is always 0), so
-  // the only ALU events this kernel writes are the branch comparisons.
-
-  // The Cpu kernel keeps one responsibility for ecall rows (the ecall decode gadget
-  // itself, and the U16ToU8 u8-range byte lookups, live on the Ecall chip):
-  //   1. commit the `is_halt` flag (certified by the Cpu→Ecall lookup).
-  template <class F>
-  __device__ inline bool populate_ecall(const FfiCpuEventU64& event, CpuColsU64<F>& cols, F* byte_trace)
-  {
-    bool is_halt = false;
-
-    if (cols.opcode_selector.is_ecall == F::one()) {
-      const uint32_t limb0 = cols.op_a_access.prev_value._0[0].as_canonical_u32();
-      const uint8_t syscall_id_byte = static_cast<uint8_t>(limb0 & 0xFF);
-
-      is_halt = syscall_id_byte == static_cast<uint8_t>(static_cast<uint32_t>(SyscallCode::HALT));
-      cols.is_halt = F::from_bool(is_halt);
-    }
-
-    return is_halt;
-  }
-
-  template <class F>
   __device__ inline void assign_padding_row(CpuColsU64<F>& cols)
   {
     cols.opcode_selector.imm_b = F::one();
     cols.opcode_selector.imm_c = F::one();
   }
 
+  // The CPU row of the step `fetched` holds, written from the history's rows: no CPU event is built.
+  // A present register slot's access columns are filled where the AIR reads them (`a` always, `b`
+  // and `c` when read); `a`, `b` and `c` are the operands, exceptions applied, which is what a branch
+  // compares and a JALR target sums. No column reads the memory slot, so the step may be fetched with
+  // MemorySlot::Skip. A branch's comparison row is the less-than chip's, built from the branch list,
+  // so only its two bits are written here. The row must start zeroed: absent fields stay 0.
   template <class F>
-  __device__ void event_to_row(
-    const FfiCpuEventU64& event, CpuColsU64<F>& cols, F* byte_trace,
-    AluEventU64* alu_lt_events)
+  __device__ inline void fetched_to_row(
+    const history::History& h, const history::Fetched& fetched, CpuColsU64<F>& cols, F* byte_trace)
   {
-    populate_chunk_clk<F>(event, cols);
+    const history::Step& step = fetched.step;
+    const InstructionU64& instruction = fetched.instruction;
+    const history::Slots slots = fetched.accesses.slots;
+    const history::Operands& operands = fetched.operands;
 
-    write_pc_from_u64(cols.pc, event.pc);
-    write_pc_from_u64(cols.next_pc, event.next_pc);
+    // No chunk column: the AIR's messages carry the `execution_chunk` public value. One `clk`
+    // column; the Rust side asserts clk < 2^25 (the chunk-split budget) and this side does not. No
+    // byte event for clk: no such lookup exists (clk is bounded by the row chain, riscv_cpu/chunk_clk).
+    cols.clk = F::from_canonical_u32(step.clk);
 
-    // No pc or next_pc range-check events: both lookups are gone on the Rust side. pc's two
-    // limbs are pinned element by element by the Program lookup to the preprocessed table's
-    // canonical Pc(pc_base + 4i), which is stronger than a range check; next_pc is bound to
-    // the successor row's pc, or to a public value the recursion chain pins. Emitting events
-    // here would leave the Byte table with multiplicity no lookup claims, and even an honest
-    // trace would fail the regional cumulative sum. Mirrors riscv_cpu/traces.rs.
+    // No pc or next_pc range-check events: pc's two limbs are pinned by the Program lookup to the
+    // preprocessed table's canonical Pc(pc_base + 4i), and next_pc is bound to the successor row's
+    // pc or to a public value the recursion chain pins. Mirrors riscv_cpu/traces.rs.
+    write_pc_from_u64(cols.pc, step.pc);
+    write_pc_from_u64(cols.next_pc, step.next_pc);
 
-    instruction::populate_instruction_u64<F>(event.instruction, cols.instruction);
-    populate_opcode_selector<F>(event.instruction, cols.opcode_selector);
+    instruction::populate_instruction_u64<F>(instruction, cols.instruction);
+    populate_opcode_selector<F>(instruction, cols.opcode_selector);
 
-    write_word_from_u64(cols.op_a_access.value_mut(), event.a);
-    write_word_from_u64(cols.op_b_access.value_mut(), event.b);
-    write_word_from_u64(cols.op_c_access.value_mut(), event.c);
+    // A present slot's access value overwrites its operand below; an absent one keeps the operand.
+    write_word_from_u64(cols.op_a_access.value_mut(), operands.a);
+    write_word_from_u64(cols.op_b_access.value_mut(), operands.b);
+    write_word_from_u64(cols.op_c_access.value_mut(), operands.c);
 
-    // Populate memory accesses for operands
-    if (event.a_record.tag == FfiOption<MemoryRecordEnumU64>::Tag::Some) {
-      populate_read_write_cols_u64<F>(
-        cols.op_a_access, event.a_record.some._0, byte_trace);
+    // `a`, read or written. A read's `prev_value` is its own value (history::accesses_of), so one
+    // field serves both kinds. No byte event for a jump row's return address: the AIR has no range
+    // check on op_a there (pc_carry below is pinned to the Program table's [pc0 >= 0xFFFC]).
+    const history::Access& a = fetched.accesses.at[history::SLOT_A];
+    if (slots.contains(history::SLOT_A)) {
+      write_word_from_u64(cols.op_a_access.prev_value, a.prev_value);
+      populate_memory_access_u64<F>(
+        cols.op_a_access.access, a.value, h.chunk, history::timestamp(step, history::SLOT_A), a.prev_chunk,
+        a.prev_timestamp, byte_trace);
     }
-    // No byte event for a jump row's return address: the AIR has no range check on op_a there
-    // (limb 0 of pc+4 is canonical because pc_carry below is pinned to the Program table's
-    // [pc0 >= 0xFFFC], Rust register/constraints.rs). Emitting one would unbalance the multiset.
-
-    if (event.b_record.tag == FfiOption<MemoryRecordEnumU64>::Tag::Some &&
-        event.b_record.some._0.tag == MemoryRecordEnumU64::Tag::Read) {
-      populate_read_cols_u64<F>(
-        cols.op_b_access, event.b_record.some._0.read._0, byte_trace);
+    if (slots.contains(history::SLOT_B) && !slots.writes(history::SLOT_B)) {
+      const history::Access& b = fetched.accesses.at[history::SLOT_B];
+      populate_memory_access_u64<F>(
+        cols.op_b_access.access, b.value, h.chunk, history::timestamp(step, history::SLOT_B), b.prev_chunk,
+        b.prev_timestamp, byte_trace);
     }
-    if (event.c_record.tag == FfiOption<MemoryRecordEnumU64>::Tag::Some &&
-        event.c_record.some._0.tag == MemoryRecordEnumU64::Tag::Read) {
-      populate_read_cols_u64<F>(
-        cols.op_c_access, event.c_record.some._0.read._0, byte_trace);
-    }
-
-    size_t alu_lt_index = 0;
-
-    populate_branch<F>(event, cols, alu_lt_events, alu_lt_index);
-    populate_ecall(event, cols, byte_trace);
-
-    // num_extra_clk: for ecall instructions, extract 3rd byte of syscall code
-    // (bits 16-23 of op_a prev_value as u64). In u16-limb layout, this is
-    // the low 8 bits of _0[1] (limb 1 = bits[16:31]).
-    // For non-ecall, remains 0 (pre-zeroed).
-    if (instruction::is_ecall_instruction_u64(event.instruction)) {
-      const uint32_t limb1 = cols.op_a_access.prev_value._0[1].as_canonical_u32();
-      cols.num_extra_clk = F::from_canonical_u8(static_cast<uint8_t>(limb1 & 0xFF));
+    if (slots.contains(history::SLOT_C) && !slots.writes(history::SLOT_C)) {
+      const history::Access& c = fetched.accesses.at[history::SLOT_C];
+      populate_memory_access_u64<F>(
+        cols.op_c_access.access, c.value, h.chunk, history::timestamp(step, history::SLOT_C), c.prev_chunk,
+        c.prev_timestamp, byte_trace);
     }
 
-    // pc_carry = [pc0 >= 0xFFFC] on every real row (mirrors Rust riscv_cpu/traces.rs). The
-    // Program message carries the column, so it has to equal the preprocessed table's value for
-    // this pc (program.cuh writes the same function of the row's pc). On a jump row with
-    // rd != x0 it is the carry out of limb 0 in pc+4=op_a: a table pc is 4-aligned, so pc0+4
-    // overflows exactly when pc0 == 0xFFFC. Only limb 0 can carry (a guest address stays below
-    // 0x7800_0000, so limb 1 absorbs it and op_a's limb 2 is zero); the AIR checks those two as
-    // plain equalities. Padding rows leave it at 0 (assign_padding_row).
-    cols.pc_carry = F::from_bool((event.pc & 0xFFFF) >= 0xFFFC);
+    // A branch commits a_lt_b and a_gt_b; `a_eq_b` and the taken predicate are derived in the AIR
+    // (CpuChip::branch_taken_expr). Its comparison row is the less-than chip's, from the branch
+    // list. A taken branch emits no ADD event: the AIR proves next_pc = pc + c as one field
+    // equation. No Cpu row emits an ADD (a JAL target is a field equation, a JALR target four carry
+    // bits in-chip, and AUIPC arrives re-encoded as an ALU ADD).
+    if (instruction::is_branch_instruction_u64(instruction)) {
+      const bool is_signed = instruction.opcode == Opcode::BLT || instruction.opcode == Opcode::BGE;
+      const bool a_lt_b =
+        is_signed ? static_cast<int64_t>(operands.a) < static_cast<int64_t>(operands.b) : operands.a < operands.b;
+      const bool a_gt_b =
+        is_signed ? static_cast<int64_t>(operands.a) > static_cast<int64_t>(operands.b) : operands.a > operands.b;
+      cols.a_lt_b = F::from_bool(a_lt_b);
+      cols.a_gt_b = F::from_bool(a_gt_b);
+    }
+
+    // An ECALL's syscall code is what `a` held before the call wrote it (the prev_value limbs
+    // above): its low byte names the syscall, so the row commits is_halt (certified by the
+    // Cpu->Ecall lookup), and its third byte is the extra cycles. The decode gadget and its byte
+    // lookups live on the Ecall chip.
+    if (instruction::is_ecall_instruction_u64(instruction)) {
+      const uint64_t code = slots.contains(history::SLOT_A) ? a.prev_value : 0;
+      cols.is_halt = F::from_bool(
+        static_cast<uint8_t>(code & 0xFF) == static_cast<uint8_t>(static_cast<uint32_t>(SyscallCode::HALT)));
+      cols.num_extra_clk = F::from_canonical_u8(static_cast<uint8_t>((code >> 16) & 0xFF));
+    }
+
+    // pc_carry = [pc0 >= 0xFFFC] on every real row: the Program message carries it, so it must
+    // equal the preprocessed table's value for this pc (program.cuh writes the same function). On
+    // a jump row with rd != x0 it is the carry out of limb 0 in pc+4 = op_a. Padding rows leave it 0.
+    cols.pc_carry = F::from_bool((step.pc & 0xFFFF) >= 0xFFFC);
 
     cols.is_real = F::one();
 
-    // Dispatch multiplicity, zero when the destination is `x0`. Mirrors the host side
-    // (riscv_cpu/traces.rs): the CPU AIR gates the ALU lookup on this, so a row written here
-    // without it would ask for a lookup the AIR never emits.
-    const F not_x0 = F::from_bool(event.instruction.op_a != 0);
-    cols.is_alu_not_x0 =
-        F::from_bool(instruction::is_alu_instruction_u64(event.instruction)) * not_x0;
+    // The ALU dispatch multiplicity, zero when the destination is `x0` (riscv_cpu/traces.rs): the
+    // AIR gates the ALU lookup on it.
+    const F not_x0 = F::from_bool(instruction.op_a != 0);
+    cols.is_alu_not_x0 = F::from_bool(instruction::is_alu_instruction_u64(instruction)) * not_x0;
 
     // Bit 0 of the unmasked JALR target, which the emulator masked out of `next_pc`.
-    cols.jalr_lsb = (event.instruction.opcode == Opcode::JALR)
-                        ? F::from_canonical_u32(static_cast<uint32_t>((event.b + event.c) & 1ull))
-                        : F::zero();
+    cols.jalr_lsb = (instruction.opcode == Opcode::JALR)
+                      ? F::from_canonical_u32(static_cast<uint32_t>((operands.b + operands.c) & 1ull))
+                      : F::zero();
   }
 
 } // namespace pico_gpu::cpu_u64

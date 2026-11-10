@@ -95,6 +95,31 @@ struct VirtLens {
     const FpExt *pad_dens;
 };
 
+// A segmented input (cuda-mle's `seg_virtual`): the leaves are cut into aligned
+// power-of-two blocks of at least 2^g leaves, each all real or all one padding leaf, and only the
+// real blocks are stored, back to back, each as the dense in-place tree over its own leaves. In
+// the position space of a layer or folded vector below level g, block entries are the positions
+// whose low (log_len - log) bits equal its id; the high bits are its local position.
+struct SegBlk {
+    uint32_t base;  // storage index of the block's first leaf (real blocks)
+    uint32_t log;  // log2 of its leaf count
+    uint32_t id;
+    uint32_t konst;  // its padding leaf in the constants table (pad blocks)
+};
+
+// The real blocks in storage order, and the real block of each storage granule (2^g entries).
+struct SegTab {
+    const SegBlk *blk;
+    const uint32_t *cgran;
+    uint32_t g;
+    uint32_t log_len;
+};
+
+// The real block holding storage index `at`.
+__device__ __forceinline__ SegBlk seg_block_at(SegTab const &tab, size_t at) {
+    return tab.blk[tab.cgran[at >> tab.g]];
+}
+
 // Loads entry pos of a buffer whose active layer has `active` entries: plain in a dense instance,
 // through virt_load in a virtual one.
 template <bool VIRT>
@@ -1899,11 +1924,22 @@ void bit_rev_frac_build_k2_kernel(
 // arithmetic is unchanged from the scalar kernel.
 __device__ __forceinline__ void frac_copy(FracExt *out_ptr, const FracExt *in_ptr) { *out_ptr = *in_ptr; }
 
-template <bool VIRT>
+//
+// SEG: buf is a segmented input's storage and every real block is permuted and built on its own;
+// the grid has one block per 2^11 storage entries, so each block of 256 threads makes exactly one
+// pass (a real block is at least a granule, 2^11 or more entries).
+template <bool VIRT, bool SEG = false>
 __launch_bounds__(256) __global__
 void bit_rev_frac_build_k2_vec_kernel(
-    FracExt* buf, uint32_t log_n, FpExt den_shift, uint32_t real_len)
+    FracExt* buf, uint32_t log_n, FpExt den_shift, uint32_t real_len, SegTab seg_tab)
 {
+    index_t grid_first = blockIdx.x;
+    if constexpr (SEG) {
+        SegBlk b = seg_block_at(seg_tab, (size_t)blockIdx.x << 11);
+        buf += b.base;
+        log_n = b.log;
+        grid_first = blockIdx.x - (b.base >> 11);
+    }
     // layer of each written tile row: [0] three merges up, [1] two, [2,3] one, [4..7] leaves
     constexpr uint32_t ROW_LAYER[8] = {3, 2, 1, 1, 0, 0, 0, 0};
     constexpr uint32_t TILE_W = 8;
@@ -1922,7 +1958,7 @@ void bit_rev_frac_build_k2_vec_kernel(
     uint32_t lane_rev = bit_rev(pos, LOG_TILE_W);
 
     index_t z_stride = (index_t)1 << (log_n - LOG_TILE_W);
-    index_t walk = threadIdx.x + blockDim.x * (index_t)blockIdx.x;
+    index_t walk = threadIdx.x + blockDim.x * grid_first;
 
     #pragma unroll 1
     do {
@@ -2051,7 +2087,7 @@ int launch_bit_rev_frac_build_k2(FracExt* buf, uint32_t log_n, FpExt den_shift, 
             smem_cap_set[dev_slot].fetch_or(1, std::memory_order_release);
         }
         bit_rev_frac_build_k2_vec_kernel<VIRT><<<dim3(n_grid), tpb, smem_bytes_vec>>>(
-            buf, log_n, den_shift, real_len);
+            buf, log_n, den_shift, real_len, SegTab{});
         return CHECK_KERNEL();
     }
 
@@ -2074,6 +2110,636 @@ extern "C" int _kb_gkr_bit_rev_frac_ext_build_k2(
     if (real_len < ((size_t)1 << log_n))
         return launch_bit_rev_frac_build_k2<true>(buf, log_n, den_shift, (uint32_t)real_len);
     return launch_bit_rev_frac_build_k2<false>(buf, log_n, den_shift, (uint32_t)real_len);
+}
+
+// ----------------------------------------------------------------------------
+// Segmented input (see SegBlk)
+// ----------------------------------------------------------------------------
+// Every kernel below runs a dense kernel's body on each real block, with threads in storage
+// order: work item w covers 2^sh storage entries from w << sh, so its block is the one of storage
+// granule (w << sh) >> g (sh <= g), and its local index is w - (base >> sh). A round's eq weight of
+// local position p is the dense table's at (p << (log_len - log)) | id. Pad blocks never reach these
+// kernels: their contribution to a round, eq(id) times a constant, is gkr_seg_pad_sum's.
+
+// Pad nodes of each level per constant: padtab[k * SEG_PAD_LEVELS + l] is 2^l copies of constant
+// k, its denominator shifted, added up.
+constexpr uint32_t SEG_PAD_LEVELS = 32;
+
+// frac_build_tree_layer_kernel (merge, no shift) on every real block: level -> level + 1.
+__global__ void seg_build_layer_kernel(FracExt *nodes, SegTab tab, uint32_t level, uint32_t n_work) {
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_work) return;
+    uint32_t sh = level + 1;
+    SegBlk b = seg_block_at(tab, (size_t)w << sh);
+    uint32_t h_off = 1u << (b.log - sh);
+    uint32_t pos = w - (b.base >> sh);
+    FracExt *loc = nodes + b.base;
+    FracExt left = loc[pos];
+    frac_add_inplace(left, loc[pos | h_off]);
+    loc[pos] = left;
+}
+
+// frac_build_tree_two_layers_kernel on every real block: level -> level + 2.
+__global__ void seg_build_two_layers_kernel(FracExt *nodes, SegTab tab, uint32_t level, uint32_t n_work) {
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_work) return;
+    uint32_t sh = level + 2;
+    SegBlk b = seg_block_at(tab, (size_t)w << sh);
+    uint32_t h_inner = 1u << (b.log - sh);
+    uint32_t h_outer = h_inner << 1;
+    uint32_t t = w - (b.base >> sh);
+    FracExt *loc = nodes + b.base;
+    FracExt fa = loc[t];
+    FracExt fb = loc[t + h_inner];
+    FracExt fc = loc[t + h_outer];
+    FracExt fd = loc[t + h_outer + h_inner];
+    FracExt left = frac_add(fa, fc);
+    FracExt right = frac_add(fb, fd);
+    loc[t] = frac_add(left, right);
+    loc[t + h_inner] = right;
+}
+
+// compute_round_and_revert_kernel on every real block of the layer at `level`, in place.
+__global__ void seg_round_revert_kernel(
+    const FpExt *__restrict__ eq_lo,
+    const FpExt *__restrict__ eq_hi,
+    FracExt *__restrict__ nodes,
+    SegTab tab,
+    uint32_t level,
+    uint32_t n_work,
+    uint32_t lo_bits,
+    FpExt lam,
+    FpExt *__restrict__ blk_sums
+) {
+    extern __shared__ FpExt red_smem[];
+    const uint32_t sh = level + 2;
+    const FpExt zero(Fp::zero());
+    FpExt acc_s1 = zero, acc_s2 = zero;
+    for (uint32_t w = threadIdx.x + blockIdx.x * blockDim.x; w < n_work;
+         w += blockDim.x * gridDim.x) {
+        SegBlk b = seg_block_at(tab, (size_t)w << sh);
+        uint32_t pos = w - (b.base >> sh);
+        uint32_t pq_len = 1u << (b.log - level);
+        uint32_t h_off = pq_len >> 1;
+        uint32_t q_off = pq_len >> 2;
+        FracExt *loc = nodes + b.base;
+
+        FpExt n0_at0, d0_at0, n1_at0, d1_at0;
+        FpExt n0_at1, d0_at1, n1_at1, d1_at1;
+        {
+            FracExt left = frac_load(loc + pos);
+            FracExt right = frac_load(loc + pos + h_off);
+            FpExt right_q_inv = inv(right.q);
+            d0_at0 = left.q * right_q_inv;
+            n0_at0 = (left.p - d0_at0 * right.p) * right_q_inv;
+            n1_at0 = right.p;
+            d1_at0 = right.q;
+            frac_store(loc + pos, {n0_at0, d0_at0});
+        }
+        {
+            FracExt left = frac_load(loc + pos + q_off);
+            FracExt right = frac_load(loc + pos + h_off + q_off);
+            FpExt right_q_inv = inv(right.q);
+            d0_at1 = left.q * right_q_inv;
+            n0_at1 = (left.p - d0_at1 * right.p) * right_q_inv;
+            n1_at1 = right.p;
+            d1_at1 = right.q;
+            frac_store(loc + pos + q_off, {n0_at1, d0_at1});
+        }
+        uint32_t eq_pos = (pos << (tab.log_len - b.log)) | b.id;
+        accum_round_terms(
+            eq_lo, eq_hi, eq_pos, lo_bits, lam,
+            n0_at0, d0_at0, n0_at1, d0_at1,
+            n1_at0, d1_at0, n1_at1, d1_at1,
+            acc_s1, acc_s2
+        );
+    }
+    store_pair_block_sums(red_smem, acc_s1, acc_s2, blk_sums);
+}
+
+// compute_round_and_fold_kernel on every real block of a segmented vector at level `c_in` (block
+// entries 2^(log - c_in)), stored from base >> src_sh in src; the folded vector goes to
+// base >> dst_sh in dst. src == dst with src_sh == dst_sh folds in place: a thread stores only
+// to low-half slots it loaded itself, as in compute_round_and_fold_inplace_kernel.
+__global__ void seg_round_fold_kernel(
+    const FpExt *__restrict__ eq_lo,
+    const FpExt *__restrict__ eq_hi,
+    const FracExt *src,
+    uint32_t src_sh,
+    FracExt *dst,
+    uint32_t dst_sh,
+    SegTab tab,
+    uint32_t c_in,
+    uint32_t n_work,
+    uint32_t lo_bits,
+    FpExt lam,
+    FpExt fold_r,
+    FpExt *__restrict__ blk_sums
+) {
+    extern __shared__ FpExt red_smem[];
+    const uint32_t sh = c_in + 3;
+    const FpExt zero(Fp::zero());
+    FpExt acc_s1 = zero, acc_s2 = zero;
+    for (uint32_t w = threadIdx.x + blockIdx.x * blockDim.x; w < n_work;
+         w += blockDim.x * gridDim.x) {
+        SegBlk b = seg_block_at(tab, (size_t)w << sh);
+        uint32_t pos = w - (b.base >> sh);
+        uint32_t pq_len = 1u << (b.log - c_in - 1);  // after the fold
+        const uint32_t h_off = pq_len;
+        const uint32_t q_off = pq_len >> 1;
+        const uint32_t e_off = pq_len >> 2;
+        const uint32_t e3_off = e_off * 3;
+        const FracExt *in = src + (b.base >> src_sh);
+        FracExt *out = dst + (b.base >> dst_sh);
+
+        FpExt n0_at0, d0_at0, n1_at0, d1_at0;
+        FpExt n0_at1, d0_at1, n1_at1, d1_at1;
+        // Every load comes before any store: in place, the stores overwrite loaded slots.
+        FracExt a0 = frac_load(in + pos);
+        FracExt a1 = frac_load(in + pos + q_off);
+        FracExt b0 = frac_load(in + pos + h_off);
+        FracExt b1 = frac_load(in + pos + h_off + q_off);
+        FracExt c0 = frac_load(in + pos + e_off);
+        FracExt c1 = frac_load(in + pos + e3_off);
+        FracExt e0 = frac_load(in + pos + h_off + e_off);
+        FracExt e1 = frac_load(in + pos + h_off + e3_off);
+        n0_at0 = a0.p + fold_r * (a1.p - a0.p);
+        d0_at0 = a0.q + fold_r * (a1.q - a0.q);
+        n1_at0 = b0.p + fold_r * (b1.p - b0.p);
+        d1_at0 = b0.q + fold_r * (b1.q - b0.q);
+        n0_at1 = c0.p + fold_r * (c1.p - c0.p);
+        d0_at1 = c0.q + fold_r * (c1.q - c0.q);
+        n1_at1 = e0.p + fold_r * (e1.p - e0.p);
+        d1_at1 = e0.q + fold_r * (e1.q - e0.q);
+        frac_store(out + pos, {n0_at0, d0_at0});
+        frac_store(out + pos + q_off, {n1_at0, d1_at0});
+        frac_store(out + pos + e_off, {n0_at1, d0_at1});
+        frac_store(out + pos + e3_off, {n1_at1, d1_at1});
+
+        uint32_t eq_pos = (pos << (tab.log_len - b.log)) | b.id;
+        accum_round_terms(
+            eq_lo, eq_hi, eq_pos, lo_bits, lam,
+            n0_at0, d0_at0, n0_at1, d0_at1,
+            n1_at0, d1_at0, n1_at1, d1_at1,
+            acc_s1, acc_s2
+        );
+    }
+    store_pair_block_sums(red_smem, acc_s1, acc_s2, blk_sums);
+}
+
+// The dense vector (2^n_log entries, bit-reversed positions) of a segmented one at level c whose
+// real blocks are stored from base >> src_sh in src; pad entries are the level-`pad_level` pad
+// node of their block's constant. lgran: per leaf granule, the real block index or
+// 0x80000000 | konst.
+__global__ void seg_gather_kernel(
+    const FracExt *__restrict__ src,
+    uint32_t src_sh,
+    SegTab tab,
+    const uint32_t *__restrict__ lgran,
+    const FracExt *__restrict__ padtab,
+    uint32_t pad_level,
+    uint32_t c,
+    FracExt *__restrict__ dst,
+    uint32_t n_log
+) {
+    uint32_t pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= (1u << n_log)) return;
+    size_t leaf = (size_t)bit_rev(pos, n_log) << c;
+    uint32_t e = lgran[leaf >> tab.g];
+    FracExt v;
+    if (e & 0x80000000u) {
+        v = padtab[(size_t)(e & 0x7fffffffu) * SEG_PAD_LEVELS + pad_level];
+    } else {
+        SegBlk b = tab.blk[e];
+        v = src[(b.base >> src_sh) + (pos >> (tab.log_len - b.log))];
+    }
+    dst[pos] = v;
+}
+
+__global__ void seg_pad_table_kernel(
+    const FracExt *__restrict__ consts,
+    uint32_t n_consts,
+    FpExt den_shift,
+    FracExt *__restrict__ padtab
+) {
+    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n_consts) return;
+    FracExt v = consts[k];
+    v.q = v.q + den_shift;
+    for (uint32_t l = 0; l < SEG_PAD_LEVELS; l++) {
+        padtab[(size_t)k * SEG_PAD_LEVELS + l] = v;
+        v = frac_add(v, v);
+    }
+}
+
+// One block: sum over pad blocks of eq(id) * term, where term is a round kernel's summand at four
+// equal level-`level` pad nodes (n, d): (n + lam d) d + n d, and eq(id) the eq table summed over the
+// block's positions, the product over its low (log_len - log) bits i of x_i or 1 - x_i, x_i =
+// xi_rev[i] (the coordinate of position bit i, the last coordinate first).
+__global__ void seg_pad_sum_kernel(
+    const SegBlk *__restrict__ pads,
+    uint32_t n_pads,
+    const FracExt *__restrict__ padtab,
+    uint32_t level,
+    FpExt lam,
+    const FpExt *__restrict__ xi_rev,
+    uint32_t log_len,
+    FpExt *__restrict__ out
+) {
+    extern __shared__ FpExt red_smem[];
+    const FpExt one(Fp::one());
+    FpExt acc(Fp::zero());
+    for (uint32_t j = threadIdx.x; j < n_pads; j += blockDim.x) {
+        SegBlk b = pads[j];
+        FpExt e = one;
+        uint32_t k = log_len - b.log;
+        for (uint32_t i = 0; i < k; i++) {
+            FpExt x = xi_rev[i];
+            e = e * (((b.id >> i) & 1u) ? x : one - x);
+        }
+        FracExt v = padtab[(size_t)b.konst * SEG_PAD_LEVELS + level];
+        FpExt term = (v.p + lam * v.q) * v.q + v.p * v.q;
+        acc += e * term;
+    }
+    FpExt total = reduce::block_reduce_sum(acc, red_smem);
+    if (threadIdx.x == 0) out[0] = total;
+}
+
+// precompute_m_build_partial_kernel over a segmented vector at level c_src (block entries
+// 2^(log - c_src), stored from base >> src_sh): a tail point is a (block, local tail point) pair,
+// enumerated in storage order (sh storage entries each), its eq weight the tail table's at
+// (lt << (log_len - log)) | id. Pad blocks add the same constant to every M entry, which the host
+// adds to the round sums instead.
+template <bool fold_inline, uint32_t LOGW>
+__global__ void seg_precompute_m_build_partial_kernel(
+    const FracExt *__restrict__ src,
+    uint32_t src_sh,
+    SegTab tab,
+    uint32_t c_src,
+    uint32_t n_items,
+    FpExt lam,
+    FpExt fold_r,
+    const FpExt *__restrict__ tail_eq_lo,
+    const FpExt *__restrict__ tail_eq_hi,
+    uint32_t tail_lo_bits,
+    uint32_t tile_len,
+    FpExt *__restrict__ partials
+) {
+    constexpr uint32_t side = 1u << LOGW;
+    uint32_t ri = threadIdx.y;
+    uint32_t ci = threadIdx.x;
+    if (ri >= side || ci >= side) {
+        return;
+    }
+    const uint32_t sh = c_src + (fold_inline ? 2 : 1) + LOGW;
+    uint32_t t_begin = blockIdx.x * tile_len;
+    uint32_t t_end = min(t_begin + tile_len, n_items);
+
+    constexpr uint32_t pad_stride = side + 1;
+    extern __shared__ FpExt smem_pool[];
+    FpExt *s_l0 = smem_pool;
+    FpExt *s_l1 = s_l0 + pad_stride * TAIL_CHUNK;
+    FpExt *s_r0 = s_l1 + pad_stride * TAIL_CHUNK;
+    FpExt *s_r1 = s_r0 + pad_stride * TAIL_CHUNK;
+    FpExt *s_w = s_r1 + pad_stride * TAIL_CHUNK;
+    // Per tail point: where its local tail point starts in src, its block's tail length and
+    // per-polynomial half.
+    uint32_t *s_in = reinterpret_cast<uint32_t *>(s_w + TAIL_CHUNK);
+    uint32_t *s_tl = s_in + TAIL_CHUNK;
+    uint32_t *s_half = s_tl + TAIL_CHUNK;
+
+    FpExt zero(Fp::zero());
+    constexpr uint32_t ACC_LANES = 4;
+    FpExt accs[ACC_LANES];
+#pragma unroll
+    for (uint32_t ai = 0; ai < ACC_LANES; ++ai) accs[ai] = zero;
+
+    uint32_t flat_tid = threadIdx.y * blockDim.x + threadIdx.x;
+    uint32_t n_threads = blockDim.x * blockDim.y;
+
+    for (uint32_t chunk0 = t_begin; chunk0 < t_end; chunk0 += TAIL_CHUNK) {
+        uint32_t chunk_len = min(TAIL_CHUNK, t_end - chunk0);
+        uint32_t chunk_elems = chunk_len * side;
+
+        for (uint32_t slot = flat_tid; slot < chunk_len; slot += n_threads) {
+            uint32_t u = chunk0 + slot;
+            SegBlk b = seg_block_at(tab, (size_t)u << sh);
+            uint32_t lt = u - (b.base >> sh);
+            uint32_t half = 1u << (b.log - c_src - 1);
+            s_in[slot] = (b.base >> src_sh) + lt;
+            s_tl[slot] = 1u << (b.log - sh);
+            s_half[slot] = half;
+            uint32_t eq_pt = (lt << (tab.log_len - b.log)) | b.id;
+            s_w[slot] = eq_split_lookup(tail_eq_lo, tail_eq_hi, tail_lo_bits, eq_pt);
+        }
+        __syncthreads();
+
+        for (uint32_t pos = flat_tid; pos < chunk_elems; pos += n_threads) {
+            uint32_t hi_bits = pos / chunk_len;
+            uint32_t slot = pos - hi_bits * chunk_len;
+            const FracExt *in = src + s_in[slot] + hi_bits * s_tl[slot];
+            uint32_t half = s_half[slot];
+            FpExt n0, d0, n1, d1;
+            if constexpr (fold_inline) {
+                uint32_t fold_off = half >> 1;
+                FracExt lo0 = frac_load(in);
+                FracExt hi0 = frac_load(in + fold_off);
+                FracExt lo1 = frac_load(in + half);
+                FracExt hi1 = frac_load(in + half + fold_off);
+                n0 = lo0.p + fold_r * (hi0.p - lo0.p);
+                d0 = lo0.q + fold_r * (hi0.q - lo0.q);
+                n1 = lo1.p + fold_r * (hi1.p - lo1.p);
+                d1 = lo1.q + fold_r * (hi1.q - lo1.q);
+            } else {
+                FracExt fr0 = frac_load(in);
+                FracExt fr1 = frac_load(in + half);
+                n0 = fr0.p; d0 = fr0.q;
+                n1 = fr1.p; d1 = fr1.q;
+            }
+            uint32_t cell = slot * pad_stride + hi_bits;
+            FpExt w_b = s_w[slot];
+            s_l0[cell] = w_b * (n0 + lam * d0);
+            s_l1[cell] = w_b * n1;
+            s_r0[cell] = d0;
+            s_r1[cell] = d1;
+        }
+        __syncthreads();
+
+        uint32_t slot = 0;
+        for (; slot + ACC_LANES <= chunk_len; slot += ACC_LANES) {
+#pragma unroll
+            for (uint32_t lane_j = 0; lane_j < ACC_LANES; ++lane_j) {
+                uint32_t base_row = (slot + lane_j) * pad_stride;
+                accs[lane_j] += s_l0[base_row + ri] * s_r1[base_row + ci]
+                        + s_l1[base_row + ri] * s_r0[base_row + ci];
+            }
+        }
+        for (; slot < chunk_len; ++slot) {
+            uint32_t base_row = slot * pad_stride;
+            accs[0] += s_l0[base_row + ri] * s_r1[base_row + ci]
+                    + s_l1[base_row + ri] * s_r0[base_row + ci];
+        }
+        __syncthreads();
+    }
+
+    FpExt m_entry = accs[0];
+#pragma unroll
+    for (uint32_t ai = 1; ai < ACC_LANES; ++ai) m_entry += accs[ai];
+    partials[blockIdx.x * (side * side) + ri * side + ci] = m_entry;
+}
+
+// multifold_kernel on every real block of a segmented vector at level c_src, folding LOGW
+// variables; the result, at level c_src + LOGW, goes to base >> dst_sh in dst. In place
+// (src == dst, src_sh == dst_sh) is safe: column col stores to slots col and n_cols + col, both
+// among the slots it loaded itself (bk = 0 and bk = 1 of the first polynomial).
+template <uint32_t LOGW>
+__global__ void seg_multifold_kernel(
+    const FracExt *src,
+    uint32_t src_sh,
+    FracExt *dst,
+    uint32_t dst_sh,
+    SegTab tab,
+    uint32_t c_src,
+    uint32_t n_work,
+    const FpExt *__restrict__ win_eq
+) {
+    uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= n_work) return;
+    const uint32_t sh = c_src + 1 + LOGW;
+    SegBlk b = seg_block_at(tab, (size_t)w << sh);
+    uint32_t col = w - (b.base >> sh);
+    uint32_t half = 1u << (b.log - c_src - 1);
+    uint32_t n_cols = half >> LOGW;
+    const FracExt *in = src + (b.base >> src_sh);
+    FracExt *out = dst + (b.base >> dst_sh);
+    FpExt zero(Fp::zero());
+    FpExt n0_sum = zero, d0_sum = zero, n1_sum = zero, d1_sum = zero;
+#pragma unroll
+    for (uint32_t bk = 0; bk < (1u << LOGW); ++bk) {
+        uint32_t pos = bk * n_cols + col;
+        FracExt fv0 = in[pos];
+        FracExt fv1 = in[half + pos];
+        FpExt wgt = win_eq[bk];
+        n0_sum += wgt * fv0.p;
+        d0_sum += wgt * fv0.q;
+        n1_sum += wgt * fv1.p;
+        d1_sum += wgt * fv1.q;
+    }
+    out[col] = {n0_sum, d0_sum};
+    out[n_cols + col] = {n1_sum, d1_sum};
+}
+
+extern "C" int _kb_gkr_seg_precompute_m_build(
+    const FracExt *src,
+    uint32_t src_sh,
+    size_t storage_len,
+    SegTab tab,
+    uint32_t c_src,
+    uint32_t wbits,
+    bool fold_inline,
+    FpExt lam,
+    FpExt fold_r,
+    const FpExt *tail_eq_lo,
+    const FpExt *tail_eq_hi,
+    size_t tail_eq_lo_len,
+    size_t tile_len,
+    FpExt *partials,
+    size_t partials_len,
+    FpExt *m_mat
+) {
+    uint32_t sh = c_src + (fold_inline ? 2 : 1) + wbits;
+    if (sh > tab.g || wbits < 1 || wbits > 5 || tile_len == 0) return cudaErrorInvalidValue;
+    uint32_t n_items = (uint32_t)(storage_len >> sh);
+    uint32_t tile32 = (uint32_t)tile_len;
+    uint32_t n_parts = div_ceil(n_items, tile32);
+    uint32_t side = 1u << wbits;
+    size_t n_entries = (size_t)side * side;
+    if (partials_len < (size_t)n_parts * n_entries) return cudaErrorInvalidValue;
+    uint32_t tail_lo_bits = __builtin_ctz((uint32_t)tail_eq_lo_len);
+    dim3 grid(n_parts), block(side, side);
+    size_t smem = (4 * (side + 1) * TAIL_CHUNK + TAIL_CHUNK) * sizeof(FpExt) + 3 * TAIL_CHUNK * sizeof(uint32_t);
+#define SEG_M_LAUNCH(FI, W) \
+    seg_precompute_m_build_partial_kernel<FI, W><<<grid, block, smem>>>( \
+        src, src_sh, tab, c_src, n_items, lam, fold_r, tail_eq_lo, tail_eq_hi, tail_lo_bits, tile32, partials)
+#define SEG_M_W(W) if (fold_inline) { SEG_M_LAUNCH(true, W); } else { SEG_M_LAUNCH(false, W); } break;
+    switch (wbits) {
+        case 1: SEG_M_W(1)
+        case 2: SEG_M_W(2)
+        case 3: SEG_M_W(3)
+        case 4: SEG_M_W(4)
+        case 5: SEG_M_W(5)
+    }
+#undef SEG_M_W
+#undef SEG_M_LAUNCH
+    int rc = CHECK_KERNEL();
+    if (rc != 0) return rc;
+    dim3 fin_block(128);
+    dim3 fin_grid(div_ceil((uint32_t)n_entries, fin_block.x));
+    precompute_m_reduce_partials_kernel<<<fin_grid, fin_block>>>(partials, n_parts, (uint32_t)n_entries, m_mat);
+    return CHECK_KERNEL();
+}
+
+extern "C" int _kb_gkr_seg_multifold(
+    const FracExt *src,
+    uint32_t src_sh,
+    FracExt *dst,
+    uint32_t dst_sh,
+    size_t storage_len,
+    SegTab tab,
+    uint32_t c_src,
+    uint32_t wbits,
+    const FpExt *win_eq
+) {
+    uint32_t sh = c_src + 1 + wbits;
+    if (sh > tab.g) return cudaErrorInvalidValue;
+    uint32_t n_work = (uint32_t)(storage_len >> sh);
+    auto [grid, block] = kernel_launch_params(n_work, 256);
+#define SEG_MF(W) seg_multifold_kernel<W><<<grid, block>>>(src, src_sh, dst, dst_sh, tab, c_src, n_work, win_eq); break;
+    switch (wbits) {
+        case 2: SEG_MF(2)
+        case 3: SEG_MF(3)
+        case 4: SEG_MF(4)
+        case 5: SEG_MF(5)
+        case 6: SEG_MF(6)
+        default: return cudaErrorInvalidValue;
+    }
+#undef SEG_MF
+    return CHECK_KERNEL();
+}
+
+extern "C" int _kb_gkr_seg_k3(FracExt *storage, size_t storage_len, SegTab tab, FpExt den_shift) {
+    constexpr uint32_t TILE_W = 8;
+    constexpr uint32_t tpb = 256;
+    if (storage_len == 0) return 0;
+    if (storage_len % (tpb * TILE_W) != 0 || tab.g < 11) return cudaErrorInvalidValue;
+    constexpr size_t smem_bytes_vec = (size_t)tpb * (TILE_W + 1) * sizeof(FracExt);
+    static std::atomic<int> smem_set[16] = {};
+    int dev_slot = 0;
+    cudaGetDevice(&dev_slot);
+    if (dev_slot < 0 || dev_slot >= 16) return cudaErrorInvalidDevice;
+    if (!smem_set[dev_slot].load(std::memory_order_acquire)) {
+        cudaError_t rc = cudaFuncSetAttribute(
+            bit_rev_frac_build_k2_vec_kernel<false, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)smem_bytes_vec);
+        if (rc != cudaSuccess) return rc;
+        smem_set[dev_slot].store(1, std::memory_order_release);
+    }
+    uint32_t n_grid = (uint32_t)(storage_len / (tpb * TILE_W));
+    bit_rev_frac_build_k2_vec_kernel<false, true><<<dim3(n_grid), tpb, smem_bytes_vec>>>(
+        storage, 0, den_shift, 0, tab);
+    return CHECK_KERNEL();
+}
+
+// Builds every real block's tree from `level` up to `level + 1` (two = false) or `level + 2`.
+extern "C" int _kb_gkr_seg_build(FracExt *storage, size_t storage_len, SegTab tab, uint32_t level, bool two) {
+    uint32_t sh = level + (two ? 2 : 1);
+    if (sh > tab.g) return cudaErrorInvalidValue;
+    uint32_t n_work = (uint32_t)(storage_len >> sh);
+    if (n_work == 0) return 0;
+    auto [grid, block] = kernel_launch_params(n_work, 256);
+    if (two) {
+        seg_build_two_layers_kernel<<<grid, block>>>(storage, tab, level, n_work);
+    } else {
+        seg_build_layer_kernel<<<grid, block>>>(storage, tab, level, n_work);
+    }
+    return CHECK_KERNEL();
+}
+
+extern "C" int _kb_gkr_seg_round_revert(
+    const FpExt *eq_lo,
+    const FpExt *eq_hi,
+    FracExt *storage,
+    size_t storage_len,
+    SegTab tab,
+    uint32_t level,
+    size_t eq_lo_len,
+    FpExt lam,
+    FpExt *evals_out,
+    FpExt *scratch_sums
+) {
+    uint32_t sh = level + 2;
+    if (sh > tab.g) return cudaErrorInvalidValue;
+    uint32_t n_work = (uint32_t)(storage_len >> sh);
+    auto [launch_grid, launch_block] = round_launch_shape(2 * n_work);
+    size_t smem_bytes = div_ceil(launch_block.x, WARP_SIZE) * sizeof(FpExt);
+    seg_round_revert_kernel<<<launch_grid, launch_block, smem_bytes>>>(
+        eq_lo, eq_hi, storage, tab, level, n_work, __builtin_ctz((uint32_t)eq_lo_len), lam, scratch_sums
+    );
+    int rc = CHECK_KERNEL();
+    if (rc != 0) return rc;
+    return gkr_final_reduce(scratch_sums, evals_out, launch_grid.x);
+}
+
+extern "C" int _kb_gkr_seg_round_fold(
+    const FpExt *eq_lo,
+    const FpExt *eq_hi,
+    const FracExt *src,
+    uint32_t src_sh,
+    FracExt *dst,
+    uint32_t dst_sh,
+    size_t storage_len,
+    SegTab tab,
+    uint32_t c_in,
+    size_t eq_lo_len,
+    FpExt lam,
+    FpExt fold_r,
+    FpExt *evals_out,
+    FpExt *scratch_sums
+) {
+    uint32_t sh = c_in + 3;
+    if (sh > tab.g) return cudaErrorInvalidValue;
+    uint32_t n_work = (uint32_t)(storage_len >> sh);
+    auto [launch_grid, launch_block] = round_launch_shape(2 * n_work);
+    size_t smem_bytes = div_ceil(launch_block.x, WARP_SIZE) * sizeof(FpExt);
+    seg_round_fold_kernel<<<launch_grid, launch_block, smem_bytes>>>(
+        eq_lo, eq_hi, src, src_sh, dst, dst_sh, tab, c_in, n_work,
+        __builtin_ctz((uint32_t)eq_lo_len), lam, fold_r, scratch_sums
+    );
+    int rc = CHECK_KERNEL();
+    if (rc != 0) return rc;
+    return gkr_final_reduce(scratch_sums, evals_out, launch_grid.x);
+}
+
+extern "C" int _kb_gkr_seg_gather(
+    const FracExt *src,
+    uint32_t src_sh,
+    SegTab tab,
+    const uint32_t *lgran,
+    const FracExt *padtab,
+    uint32_t pad_level,
+    uint32_t c,
+    FracExt *dst,
+    uint32_t n_log
+) {
+    if (pad_level >= SEG_PAD_LEVELS || n_log == 0 || n_log > 31) return cudaErrorInvalidValue;
+    auto [grid, block] = kernel_launch_params((size_t)1 << n_log, 256);
+    seg_gather_kernel<<<grid, block>>>(src, src_sh, tab, lgran, padtab, pad_level, c, dst, n_log);
+    return CHECK_KERNEL();
+}
+
+extern "C" int _kb_gkr_seg_pad_table(const FracExt *consts, uint32_t n_consts, FpExt den_shift, FracExt *padtab) {
+    if (n_consts == 0) return 0;
+    auto [grid, block] = kernel_launch_params(n_consts, 128);
+    seg_pad_table_kernel<<<grid, block>>>(consts, n_consts, den_shift, padtab);
+    return CHECK_KERNEL();
+}
+
+extern "C" int _kb_gkr_seg_pad_sum(
+    const SegBlk *pads,
+    uint32_t n_pads,
+    const FracExt *padtab,
+    uint32_t level,
+    FpExt lam,
+    const FpExt *xi_rev,
+    uint32_t log_len,
+    FpExt *out
+) {
+    if (level >= SEG_PAD_LEVELS) return cudaErrorInvalidValue;
+    constexpr uint32_t tpb = 256;
+    size_t smem_bytes = (tpb / WARP_SIZE) * sizeof(FpExt);
+    seg_pad_sum_kernel<<<1, tpb, smem_bytes>>>(pads, n_pads, padtab, level, lam, xi_rev, log_len, out);
+    return CHECK_KERNEL();
 }
 
 } // namespace fractional_sumcheck_gkr

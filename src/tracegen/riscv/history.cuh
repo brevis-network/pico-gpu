@@ -605,9 +605,16 @@ namespace pico_gpu::history {
     return slots;
   }
 
+  // Whether a loader reads a step's memory-slot access. A chip that proves only the register
+  // accesses may skip it: the slot is the last of a step's rows, so skipping it moves no other slot's
+  // row, and the row counts are checked against every slot either way.
+  enum class MemorySlot : uint32_t { Load, Skip };
+
   // The accesses of the step at `index`, `step` being its row, in its rows' order: `a`, `b`, `c`,
   // memory, each slot present taken from the writes if it writes and from the reads otherwise. A
-  // slice kernel's last step reads the next step's row, which its slice's copy carries.
+  // slice kernel's last step reads the next step's row, which its slice's copy carries. Under
+  // MemorySlot::Skip, `at[MEMORY]` is left as it was.
+  template <MemorySlot Memory = MemorySlot::Load>
   REPLAY_HD inline bool accesses_of(
     const History& h, uint32_t index, const Step& step, Slots slots, StepAccesses& accesses)
   {
@@ -633,6 +640,9 @@ namespace pico_gpu::history {
     uint32_t read = step.first_read;
     for (uint32_t position = POSITIONS; position-- > 0;) {
       if (!slots.contains(position)) continue;
+      if constexpr (Memory == MemorySlot::Skip) {
+        if (position == MEMORY) break;
+      }
       if (slots.writes(position)) {
         accesses.at[position] = h.writes[step.first_write];
       } else {
@@ -776,25 +786,48 @@ namespace pico_gpu::history {
     return operands;
   }
 
-  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP>
-  REPLAY_HD inline bool fetch(const History& h, uint32_t index, Fetched& fetched)
+  // fetch in two halves, so that a chip can test the opcode between them on the one fetch: the
+  // step's row and instruction, then its accesses and operands. Each half zeroes only what it
+  // fills, so a row refused on its opcode zeroes no access, and nothing past the instruction stays
+  // live between the halves.
+  REPLAY_HD inline bool fetch_instruction(const History& h, uint32_t index, Fetched& fetched)
   {
-    fetched = Fetched{};
-    if (!step_at(h, index, fetched.step) || !instruction_at(h, fetched.step.pc, fetched.instruction)) return false;
-    if (!accesses_of(h, index, fetched.step, slots_of(fetched.instruction), fetched.accesses)) return false;
+    fetched.step = Step{};
+    fetched.instruction = InstructionU64{};
+    return step_at(h, index, fetched.step) && instruction_at(h, fetched.step.pc, fetched.instruction);
+  }
+
+  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP, MemorySlot Memory = MemorySlot::Load>
+  REPLAY_HD inline bool fetch_accesses(const History& h, uint32_t index, Fetched& fetched)
+  {
+    fetched.accesses = StepAccesses{};
+    fetched.operands = Operands{};
+    if (!accesses_of<Memory>(h, index, fetched.step, slots_of(fetched.instruction), fetched.accesses)) return false;
     fetched.operands = operands_of<Lookup>(h, index, fetched.step, fetched.instruction, fetched.accesses);
     return true;
   }
 
-  // The ALU event the emulator writes for the step at row `row` of the ALU list `list`: the step's
-  // clock and operands, the instruction's opcode, and its `imm_c` as `is_imm`.
-  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP>
-  REPLAY_HD inline AluEventU64 alu_event(const History& h, uint32_t list, uint32_t row)
+  // Under MemorySlot::Skip the memory slot's access stays zero.
+  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP, MemorySlot Memory = MemorySlot::Load>
+  REPLAY_HD inline bool fetch(const History& h, uint32_t index, Fetched& fetched)
+  {
+    return fetch_instruction(h, index, fetched) && fetch_accesses<Lookup, Memory>(h, index, fetched);
+  }
+
+  // The first half of the fetch of row `row` of `list`, whose step is at `index`: what a list chip
+  // classifies the row by, `fetched.instruction.opcode`, before fetch_accesses reads the rest into the
+  // same `fetched`. The entry, its step and its instruction are read once, and a row the chip refuses
+  // on its opcode reads no access.
+  REPLAY_HD inline bool fetch_entry(const History& h, uint32_t list, uint32_t row, uint32_t& index, Fetched& fetched)
+  {
+    return entry_at(h, list, row, index) && fetch_instruction(h, index, fetched);
+  }
+
+  // The ALU event the emulator writes for a fetched step: its clock and operands, the instruction's
+  // opcode, and its `imm_c` as `is_imm`.
+  REPLAY_HD inline AluEventU64 alu_event_of(const Fetched& fetched)
   {
     AluEventU64 event = {};
-    uint32_t index = 0;
-    Fetched fetched;
-    if (!entry_at(h, list, row, index) || !fetch<Lookup>(h, index, fetched)) return event;
     event.clk = fetched.step.clk;
     event.opcode = fetched.instruction.opcode;
     event.a = fetched.operands.a;
@@ -804,31 +837,12 @@ namespace pico_gpu::history {
     return event;
   }
 
-  // The opcode of row `row` of `list`, from the program alone, for a partition by opcode.
-  REPLAY_HD inline bool entry_opcode(const History& h, uint32_t list, uint32_t row, Opcode& opcode)
+  // The less-than chip's row for a fetched branch step: its comparison, built as pico's
+  // `branch_compare` builds it. The host orders the comparisons by its own run boundaries; the chip's
+  // rows are checked as a multiset, so list order proves the same trace.
+  REPLAY_HD inline AluEventU64 compare_event_of(const Fetched& fetched)
   {
-    uint32_t index = 0;
-    Step step;
-    InstructionU64 instruction;
-    if (!entry_at(h, list, row, index) || !step_at(h, index, step) ||
-        !instruction_at(h, step.pc, instruction))
-      return false;
-    opcode = instruction.opcode;
-    return true;
-  }
-
-  // Row `row` of the less-than chip: its own list's steps, then one comparison per branch step,
-  // built as pico's `branch_compare` builds it. The host orders the comparisons by its own run
-  // boundaries; the chip's rows are checked as a multiset, so list order proves the same trace.
-  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP>
-  REPLAY_HD inline AluEventU64 compare_event(const History& h, uint32_t row)
-  {
-    const uint32_t own = list_length(h, LIST_LT);
-    if (row < own) return alu_event<Lookup>(h, LIST_LT, row);
     AluEventU64 event = {};
-    uint32_t index = 0;
-    Fetched fetched;
-    if (!entry_at(h, LIST_BRANCH, row - own, index) || !fetch<Lookup>(h, index, fetched)) return event;
     const Opcode opcode = fetched.instruction.opcode;
     const uint64_t a = fetched.operands.a, b = fetched.operands.b;
     const bool is_signed = opcode == Opcode::BLT || opcode == Opcode::BGE;
@@ -863,14 +877,12 @@ namespace pico_gpu::history {
     return option;
   }
 
-  // The CPU event the emulator writes for the step at `index`. Its `memory` is the memory access's
-  // value, of which only the presence is read, and its `exit_code`, which no chip reads, is 0.
-  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP>
-  REPLAY_HD inline FfiCpuEventU64 cpu_event(const History& h, uint32_t index)
+  // The CPU event the emulator writes for a fetched step. Its `memory` is the memory access's value,
+  // of which only the presence is read, and its `exit_code`, which no chip reads, is 0. The CPU
+  // kernel writes its rows from the fetch instead (cpu_u64::fetched_to_row).
+  REPLAY_HD inline FfiCpuEventU64 cpu_event_of(const History& h, const Fetched& fetched)
   {
     FfiCpuEventU64 event = {};
-    Fetched fetched;
-    if (!fetch<Lookup>(h, index, fetched)) return event;
     event.chunk = h.chunk;
     event.clk = fetched.step.clk;
     event.pc = fetched.step.pc;
@@ -890,22 +902,13 @@ namespace pico_gpu::history {
     return event;
   }
 
-  // The CPU event of row `row` of the memory list.
+  // The CPU event of the step at `index`, or the zero event when the step cannot be fetched.
   template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP>
-  REPLAY_HD inline FfiCpuEventU64 memory_event(const History& h, uint32_t row)
+  REPLAY_HD inline FfiCpuEventU64 cpu_event(const History& h, uint32_t index)
   {
-    uint32_t index = 0;
-    if (!entry_at(h, LIST_MEMORY, row, index)) return FfiCpuEventU64{};
-    return cpu_event<Lookup>(h, index);
-  }
-
-  // The CPU event of row `row` of the ecall list.
-  template <ExceptionLookup Lookup = DEFAULT_EXCEPTION_LOOKUP>
-  REPLAY_HD inline FfiCpuEventU64 ecall_event(const History& h, uint32_t row)
-  {
-    uint32_t index = 0;
-    if (!entry_at(h, LIST_ECALL, row, index)) return FfiCpuEventU64{};
-    return cpu_event<Lookup>(h, index);
+    Fetched fetched;
+    if (!fetch<Lookup>(h, index, fetched)) return FfiCpuEventU64{};
+    return cpu_event_of(h, fetched);
   }
 
   REPLAY_HD inline SyscallEventU64 syscall_event(const History& h, uint32_t row)

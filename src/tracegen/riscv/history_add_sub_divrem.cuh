@@ -29,11 +29,10 @@
 // their launchers only under nvcc.
 #pragma once
 
-#include "tracegen/riscv/history.cuh"
+#include "tracegen/riscv/history_launch.cuh"
 
 #if defined(__CUDACC__)
   #include <cub/cub.cuh>
-  #include "common/rusterror.h"
   #include "tracegen/riscv/add_sub.cuh"
   #include "tracegen/riscv/divrem.cuh"
 #endif
@@ -69,15 +68,31 @@ namespace pico_gpu::add_sub_divrem_history {
     }
   }
 
-  // Whether row `row` of the split's list is one of its chip's. A step of neither of the list's
-  // opcodes is misfiled: it sets the list bit and is no chip's.
-  REPLAY_HD inline bool is_mine(const history::History& h, const Split& split, uint32_t row)
+  // Whether a row of the split's list whose step is of `opcode` is one of its chip's. A step of
+  // neither of the list's opcodes is misfiled: it sets the list bit and is no chip's.
+  REPLAY_HD inline bool opcode_is_mine(const history::History& h, const Split& split, Opcode opcode)
   {
-    Opcode opcode;
-    if (!history::entry_opcode(h, split.list, row, opcode)) return false;
     if (opcode == split.opcode) return true;
     if (opcode != split.other) history::fail(h.error, history::ERROR_LIST);
     return false;
+  }
+
+  // Whether row `row` of the split's list is one of its chip's, fetched as far as its instruction:
+  // fetch_accesses on the same `index` and `fetched` reads the rest of a row that is.
+  REPLAY_HD inline bool fetch_mine(
+    const history::History& h, const Split& split, uint32_t row, uint32_t& index, history::Fetched& fetched)
+  {
+    return history::fetch_entry(h, split.list, row, index, fetched) &&
+           opcode_is_mine(h, split, fetched.instruction.opcode);
+  }
+
+  // Whether row `row` of the split's list is one of its chip's: fetch_mine's answer, so the count
+  // kernel counts exactly the rows the row kernel places.
+  REPLAY_HD inline bool is_mine(const history::History& h, const Split& split, uint32_t row)
+  {
+    uint32_t index = 0;
+    history::Fetched fetched;
+    return fetch_mine(h, split, row, index, fetched);
   }
 
   // The rows [first, end) of `length` that block `block` of `blocks` covers: consecutive ranges in
@@ -145,24 +160,18 @@ namespace pico_gpu::add_sub_divrem_history {
     }
   }
 
-  enum class Row : uint32_t {
-    // The thread writes nothing: it lies past the trace, or the fill could not be read and the
-    // error word says why.
-    Nothing,
-    Event,
-    Padding,
-  };
+  using history::Row;
 
-  // What thread `idx` of a kernel over the `rows` rows of div/rem's trace writes: its list row's
-  // event, padding past the list, or nothing. `count` is the list's length, the same in every
-  // thread, or 0 when the fill cannot be read or the list does not fit; `reports` names the one
-  // thread that reports the second.
+  // What thread `idx` of a kernel over the `rows` rows of div/rem's trace writes, `h` being the fill
+  // opened for the whole history: its list row's event, padding past the list, or nothing. `count` is
+  // the list's length, the same in every thread, or 0 when the list does not fit; `reports` names the
+  // one thread that reports it. The row is fetched once, its opcode tested between the fetch's
+  // halves; a row whose accesses cannot be read is the zero event's, the error word failing the
+  // chunk.
   REPLAY_HD inline Row divrem_row_of(
-    const history::HistoryArgs& args, size_t rows, size_t idx, bool reports, uint32_t& count, AluEventU64& event)
+    const history::History& h, size_t rows, size_t idx, bool reports, uint32_t& count, AluEventU64& event)
   {
     count = 0;
-    history::History h;
-    if (!history::open(args, history::Readiness::Complete, h)) return Row::Nothing;
     const uint32_t length = history::list_length(h, history::LIST_DIVREM);
     if (length > rows) {
       if (reports) history::fail(h.error, history::ERROR_LIST);
@@ -171,14 +180,14 @@ namespace pico_gpu::add_sub_divrem_history {
     count = length;
     if (idx >= rows) return Row::Nothing;
     if (idx >= count) return Row::Padding;
-    const uint32_t row = static_cast<uint32_t>(idx);
-    Opcode opcode;
-    if (!history::entry_opcode(h, history::LIST_DIVREM, row, opcode)) return Row::Nothing;
-    if (!is_divrem(opcode)) {
+    uint32_t index = 0;
+    history::Fetched fetched;
+    if (!history::fetch_entry(h, history::LIST_DIVREM, static_cast<uint32_t>(idx), index, fetched)) return Row::Nothing;
+    if (!is_divrem(fetched.instruction.opcode)) {
       history::fail(h.error, history::ERROR_LIST);
       return Row::Nothing;
     }
-    event = history::alu_event(h, history::LIST_DIVREM, row);
+    event = history::fetch_accesses(h, index, fetched) ? history::alu_event_of(fetched) : AluEventU64{};
     return Row::Event;
   }
 
@@ -207,12 +216,6 @@ namespace pico_gpu::add_sub_divrem_history {
   using RangeScan = cub::BlockScan<uint32_t, RANGE_THREADS>;
   using BlocksScan = cub::BlockScan<uint32_t, RANGE_BLOCKS>;
 
-  inline unsigned int grid_for(size_t rows, int block_size)
-  {
-    const size_t blocks = (rows + block_size - 1) / block_size;
-    return static_cast<unsigned int>(blocks > 0 ? blocks : 1);
-  }
-
   // The sum over this block's range of `items(row)`, in thread 0 alone.
   template <class Items>
   __device__ uint32_t range_items(uint32_t first, uint32_t end, Items items)
@@ -236,8 +239,10 @@ namespace pico_gpu::add_sub_divrem_history {
   }
 
   // Calls `place(row, at, n)` for each row of this block's range with n = `items(row)` > 0, `at`
-  // being the rank of its first item among every item of the rows before it, from `base` on. Every
-  // thread of the block calls it with the same range: the tiles step in lockstep.
+  // being the rank of its first item among every item of the rows before it, from `base` on. A thread
+  // calls `place` for the row it last called `items` on, with no call between, so `place` may read
+  // what `items` left for its row. Every thread of the block calls it with the same range: the tiles
+  // step in lockstep.
   template <class Items, class Place>
   __device__ void place_range(uint32_t first, uint32_t end, uint32_t base, Items items, Place place)
   {
@@ -286,22 +291,23 @@ namespace pico_gpu::add_sub_divrem_history {
     }
   };
 
-  // This block's range of the split's list; empty when the fill cannot be read.
-  __device__ inline bool split_range(
-    const history::HistoryArgs& args, const Split& split, history::History& h, uint32_t& first, uint32_t& end)
+  // The fill, opened once for the block, and this block's range of the split's list; null and an
+  // empty range when the fill cannot be read. Every thread of the block calls it first, since the
+  // opening's barrier waits for all of them.
+  __device__ inline const history::History* split_range(
+    const history::HistoryArgs& args, const Split& split, uint32_t& first, uint32_t& end)
   {
     first = end = 0;
-    if (!history::open(args, history::Readiness::Complete, h)) return false;
-    block_range(history::list_length(h, split.list), gridDim.x, blockIdx.x, first, end);
-    return true;
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
+    if (h) block_range(history::list_length(*h, split.list), gridDim.x, blockIdx.x, first, end);
+    return h;
   }
 
   __global__ void split_count_kernel(const history::HistoryArgs args, const Split split, uint32_t* block_rows)
   {
-    history::History h;
     uint32_t first, end;
-    split_range(args, split, h, first, end);
-    const uint32_t mine = range_items(first, end, [&](uint32_t row) { return is_mine(h, split, row) ? 1u : 0u; });
+    const history::History* h = split_range(args, split, first, end);
+    const uint32_t mine = range_items(first, end, [&](uint32_t row) { return is_mine(*h, split, row) ? 1u : 0u; });
     if (threadIdx.x == 0) block_rows[blockIdx.x] = mine;
   }
 
@@ -324,19 +330,22 @@ namespace pico_gpu::add_sub_divrem_history {
     const size_t num_cols,
     F* byte_trace)
   {
-    history::History h;
     uint32_t first, end;
-    split_range(args, split, h, first, end);
+    const history::History* h = split_range(args, split, first, end);
+    // The row `items` fetched as far as its instruction, which `place` fetches the rest of.
+    uint32_t index = 0;
+    history::Fetched fetched;
     place_range(
       first,
       end,
       block_rows[blockIdx.x],
-      [&](uint32_t row) { return is_mine(h, split, row) ? 1u : 0u; },
-      [&](uint32_t row, uint32_t at, uint32_t) {
+      [&](uint32_t row) { return fetch_mine(*h, split, row, index, fetched) ? 1u : 0u; },
+      [&](uint32_t, uint32_t at, uint32_t) {
         // Past the trace the scan has already failed the chunk; the row goes nowhere.
         if (at >= rows) return;
         Chip::template write<F>(
-          history::alu_event(h, split.list, row), &trace_matrix[size_t(at) * num_cols], byte_trace);
+          history::fetch_accesses(*h, index, fetched) ? history::alu_event_of(fetched) : AluEventU64{},
+          &trace_matrix[size_t(at) * num_cols], byte_trace);
       });
   }
 
@@ -354,12 +363,12 @@ namespace pico_gpu::add_sub_divrem_history {
     uint32_t* block_rows = nullptr;
     CUDA_OK(cudaMallocAsync(&block_rows, RANGE_BLOCKS * sizeof(uint32_t), stream));
     split_count_kernel<<<RANGE_BLOCKS, RANGE_THREADS, 0, stream>>>(args, split, block_rows);
-    CUDA_OK(cudaGetLastError());
+    history::check_launch();
     split_scan_kernel<<<1, RANGE_BLOCKS, 0, stream>>>(args, split, rows, block_rows);
-    CUDA_OK(cudaGetLastError());
+    history::check_launch();
     split_rows_kernel<Chip, F><<<RANGE_BLOCKS, RANGE_THREADS, 0, stream>>>(
       args, split, block_rows, rows, trace, num_cols, byte_trace);
-    CUDA_OK(cudaGetLastError());
+    history::check_launch();
     CUDA_OK(cudaFreeAsync(block_rows, stream));
   }
 
@@ -373,13 +382,9 @@ namespace pico_gpu::add_sub_divrem_history {
     F* byte_trace,
     cudaStream_t stream)
   {
-    try {
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+    return history::launch_zeroed(trace, trace_size, stream, [&] {
       launch_split<Chip, F>(args, split, trace_size / num_cols, trace, num_cols, byte_trace, stream);
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-    return RustError{cudaSuccess};
+    });
   }
 
   // ── div/rem's derived ADD rows ───────────────────────────────────────────────────────────────
@@ -397,10 +402,10 @@ namespace pico_gpu::add_sub_divrem_history {
     F* byte_trace)
   {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    history::History h;
-    if (!history::open(args, history::Readiness::Complete, h)) return;
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
+    if (!h) return;
     const history::FillDescriptor& d = descriptor(args);
-    if (!derived_fit(h, d, capacity, rows)) return;
+    if (!derived_fit(*h, d, capacity, rows)) return;
     for (size_t j = idx; j < d.divrem_add_rows; j += size_t(gridDim.x) * blockDim.x)
       AddRow::write<F>(derived[j], &trace_matrix[(d.add_rows + j) * num_cols], byte_trace);
   }
@@ -418,9 +423,10 @@ namespace pico_gpu::add_sub_divrem_history {
     AluEventU64* staged)
   {
     const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t count;
+    const history::History* h = history::open_block(args, history::Readiness::Complete);
+    uint32_t count = 0;
     AluEventU64 event;
-    const Row row = divrem_row_of(args, rows, idx, idx == 0, count, event);
+    const Row row = h ? divrem_row_of(*h, rows, idx, idx == 0, count, event) : Row::Nothing;
     if (idx >= rows) return;
     uint32_t written = 0;
     divrem::DivRemValueColsU64<F>* cols =
@@ -496,20 +502,16 @@ namespace pico_gpu::add_history {
     cudaStream_t stream)
   {
     using namespace add_sub_divrem_history;
-    try {
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+    return history::launch_zeroed(trace, trace_size, stream, [&] {
       const size_t rows = trace_size / num_cols;
       launch_split<AddRow, F>(
         args, Split{history::LIST_ADD, Opcode::ADD, Opcode::ADDW}, rows, trace, num_cols, byte_trace, stream);
       // One block at least: a descriptor that counts derived rows the host allocated none for must
       // still be seen.
-      derived_rows_kernel<<<grid_for(capacity, ROW_THREADS), ROW_THREADS, 0, stream>>>(
+      derived_rows_kernel<<<history::grid_for(capacity, ROW_THREADS), ROW_THREADS, 0, stream>>>(
         args, derived, capacity, rows, trace, num_cols, byte_trace);
-      CUDA_OK(cudaGetLastError());
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-    return RustError{cudaSuccess};
+      history::check_launch();
+    });
   }
 } // namespace pico_gpu::add_history
 
@@ -579,8 +581,7 @@ namespace pico_gpu::divrem_history {
     using namespace add_sub_divrem_history;
     const size_t rows = trace_size / num_cols;
     if (rows > UINT32_MAX) return RustError{cudaErrorInvalidValue};
-    try {
-      CUDA_OK(cudaMemsetAsync(trace, 0, trace_size * sizeof(F), stream));
+    return history::launch_zeroed(trace, trace_size, stream, [&] {
       // No early return on an empty list: a shape can list this chip with no rows, and its padding
       // row is not all zero.
       uint32_t* counts = nullptr;
@@ -588,21 +589,18 @@ namespace pico_gpu::divrem_history {
       CUDA_OK(cudaMallocAsync(&counts, (rows + RANGE_BLOCKS) * sizeof(uint32_t), stream));
       CUDA_OK(cudaMallocAsync(&staged, (2 * rows > 0 ? 2 * rows : 1) * sizeof(AluEventU64), stream));
       uint32_t* block_rows = counts + rows;
-      divrem_rows_kernel<<<grid_for(rows, ROW_THREADS), ROW_THREADS, 0, stream>>>(
+      divrem_rows_kernel<<<history::grid_for(rows, ROW_THREADS), ROW_THREADS, 0, stream>>>(
         args, rows, trace, num_cols, byte_trace, counts, staged);
-      CUDA_OK(cudaGetLastError());
+      history::check_launch();
       append_count_kernel<<<RANGE_BLOCKS, RANGE_THREADS, 0, stream>>>(counts, rows, block_rows);
-      CUDA_OK(cudaGetLastError());
+      history::check_launch();
       append_scan_kernel<<<1, RANGE_BLOCKS, 0, stream>>>(args, block_rows, capacity, appended);
-      CUDA_OK(cudaGetLastError());
+      history::check_launch();
       append_kernel<<<RANGE_BLOCKS, RANGE_THREADS, 0, stream>>>(counts, rows, block_rows, staged, derived, capacity);
-      CUDA_OK(cudaGetLastError());
+      history::check_launch();
       CUDA_OK(cudaFreeAsync(staged, stream));
       CUDA_OK(cudaFreeAsync(counts, stream));
-    } catch (const cuda_error& e) {
-      return RustError{e.code()};
-    }
-    return RustError{cudaSuccess};
+    });
   }
 } // namespace pico_gpu::divrem_history
 

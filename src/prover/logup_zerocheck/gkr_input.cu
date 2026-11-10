@@ -69,7 +69,9 @@ __device__ __forceinline__ FpExt load_gkr_operand(
 // Evaluates the interaction numerator/denominator DAG row by row and writes the requested nodes as
 // GKR input fractions. Intermediates live in a small per-thread array, or with SPILL_TO_GLOBAL in a
 // global buffer interleaved across threads. Each thread handles rows_per_thread rows strided by the
-// total thread count.
+// total thread count. Rows row0 .. row0 + n_eval of the n_rows-row trace are evaluated; row
+// row0 + i of interaction k goes to fracs_out[k * out_stride + i] (the dense layout is row0 = 0,
+// n_eval = out_stride = n_rows).
 template <bool SPILL_TO_GLOBAL>
 __global__ void evaluate_interactions_gkr_kernel(
     FracExt *__restrict__ fracs_out,
@@ -83,7 +85,10 @@ __global__ void evaluate_interactions_gkr_kernel(
     const uint32_t *__restrict__ pair_slots,
     const size_t n_used,
     const uint32_t n_rows,
-    const uint32_t rows_per_thread
+    const uint32_t rows_per_thread,
+    const uint32_t row0,
+    const uint32_t n_eval,
+    const uint32_t out_stride
 ) {
     uint32_t tid0 = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n_threads = gridDim.x * blockDim.x;
@@ -100,9 +105,10 @@ __global__ void evaluate_interactions_gkr_kernel(
     }
 
     for (uint32_t t = 0; t < rows_per_thread; t++) {
-        uint32_t r = tid0 + t * n_threads;
+        uint32_t r_out = tid0 + t * n_threads;
+        uint32_t r = row0 + r_out;
 
-        if (r < n_rows) {
+        if (r_out < n_eval) {
             uint32_t n_done = 0;
             // used_nodes lists the output nodes in numerator / denominator order; rules are
             // evaluated lazily up to the highest node requested so far.
@@ -209,7 +215,7 @@ __global__ void evaluate_interactions_gkr_kernel(
 
                 uint32_t slot_code = pair_slots[u];
                 size_t interaction = slot_code >> 1;
-                size_t base = (interaction * n_rows + r) * 2;
+                size_t base = (interaction * out_stride + r_out) * 2;
                 reinterpret_cast<FpExt *>(fracs_out)[base + (slot_code & 1)] = v;
             }
         }
@@ -233,9 +239,13 @@ extern "C" int _kb_logup_gkr_input_eval(
     const uint32_t *pair_slots,
     size_t n_used,
     uint32_t n_rows,
-    uint32_t rows_per_thread
+    uint32_t rows_per_thread,
+    uint32_t row0,
+    uint32_t n_eval,
+    uint32_t out_stride
 ) {
-    auto n_launch = spill ? GLOBAL_TASK_THREADS : n_rows;
+    if (n_eval == 0) return 0;
+    auto n_launch = spill ? GLOBAL_TASK_THREADS : n_eval;
     auto [grid, block] = kernel_launch_params(n_launch, 256);
     if (spill) {
         evaluate_interactions_gkr_kernel<true><<<grid, block>>>(
@@ -250,7 +260,10 @@ extern "C" int _kb_logup_gkr_input_eval(
             pair_slots,
             n_used,
             n_rows,
-            rows_per_thread
+            rows_per_thread,
+            row0,
+            n_eval,
+            out_stride
         );
     } else {
         evaluate_interactions_gkr_kernel<false><<<grid, block>>>(
@@ -265,7 +278,10 @@ extern "C" int _kb_logup_gkr_input_eval(
             pair_slots,
             n_used,
             n_rows,
-            rows_per_thread
+            rows_per_thread,
+            row0,
+            n_eval,
+            out_stride
         );
     }
     return CHECK_KERNEL();
