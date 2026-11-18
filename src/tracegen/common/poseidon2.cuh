@@ -123,8 +123,7 @@ namespace pico_gpu::poseidon2 {
 
   /// Runs the permutation on `state` IN PLACE (external linear layer, then the three round groups)
   /// and records the per-round witnesses. Used by the full-width `Poseidon2ValueColsT` rows
-  /// (`permute_and_populate`, recursion + precompile); the riscv rate-8 rows
-  /// (`riscv_poseidon2.cuh`) use `permute_and_populate_rounds_rate7` below.
+  /// (`permute_and_populate`, recursion + precompile).
   __host__ __device__ inline void permute_and_populate_rounds(
     field_t state[WIDTH],
     FullRoundT* beginning_full_rounds,
@@ -162,61 +161,6 @@ namespace pico_gpu::poseidon2 {
       for (int i = 0; i < WIDTH; i++) {
         ending_full_rounds[cnt].post[i] = state[i];
       }
-    }
-  }
-
-  /// riscv rate-8 row: `permute_and_populate_rounds` whose last ending full round records only the
-  /// `RISCV_POSEIDON2_NUM_OUTPUTS` lanes the Poseidon2 lookup reads (`last_post`); the first
-  /// `half_external_rounds - 1` ending rounds are recorded in full. `state` holds the full
-  /// permutation output on return.
-  __host__ __device__ inline void permute_and_populate_rounds_rate7(
-    field_t state[WIDTH],
-    FullRoundT* beginning_full_rounds,
-    PartialRoundT* partial_rounds,
-    FullRoundT* ending_full_rounds,
-    field_t* last_post,
-    const field_t* __restrict__ round_constants)
-  {
-    mds_light_permutation(state);
-
-    size_t rc_offset = 0;
-    unsigned int cnt;
-
-    for (cnt = 0; cnt < half_external_rounds; cnt++) {
-      add_round_constants(state, rc_offset, round_constants);
-      sbox(state, beginning_full_rounds[cnt]);
-      mds_light_permutation(state);
-      rc_offset += WIDTH;
-
-      for (int i = 0; i < WIDTH; i++) {
-        beginning_full_rounds[cnt].post[i] = state[i];
-      }
-    }
-
-    for (cnt = 0; cnt < internal_rounds; cnt++) {
-      internal_round(state, rc_offset, partial_rounds[cnt], round_constants);
-      rc_offset += WIDTH;
-    }
-
-    for (cnt = 0; cnt + 1 < half_external_rounds; cnt++) {
-      add_round_constants(state, rc_offset, round_constants);
-      sbox(state, ending_full_rounds[cnt]);
-      mds_light_permutation(state);
-      rc_offset += WIDTH;
-
-      for (int i = 0; i < WIDTH; i++) {
-        ending_full_rounds[cnt].post[i] = state[i];
-      }
-    }
-
-    // The last ending full round: full permutation step, only the output lanes are recorded.
-    add_round_constants(state, rc_offset, round_constants);
-    for (int i = 0; i < WIDTH; i++) {
-      state[i] = sbox_el(state[i]);
-    }
-    mds_light_permutation(state);
-    for (int i = 0; i < (int)RISCV_POSEIDON2_NUM_OUTPUTS; i++) {
-      last_post[i] = state[i];
     }
   }
 

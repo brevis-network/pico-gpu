@@ -72,13 +72,6 @@ namespace pico_gpu {
 
   constexpr static const uintptr_t PERMUTATION_WIDTH = 16;
 
-  /// Committed permutation inputs per riscv Poseidon2 slot (the absorption rate; the capacity
-  /// lanes are AIR constants). Mirrors Rust `RISCV_POSEIDON2_NUM_INPUTS`.
-  constexpr static const uintptr_t RISCV_POSEIDON2_NUM_INPUTS = 8;
-  /// Committed permutation outputs per riscv Poseidon2 slot: the lanes the Poseidon2 lookup
-  /// reads. Mirrors Rust `RISCV_POSEIDON2_NUM_OUTPUTS`.
-  constexpr static const uintptr_t RISCV_POSEIDON2_NUM_OUTPUTS = 7;
-
   /// RISC-V X0 register
   constexpr static const uint32_t REGISTER_X0 = 0;
 
@@ -1145,26 +1138,6 @@ namespace pico_gpu {
 
   // ────────────────────────────────────────────────────────────────────
 
-  /// A block of columns for septic extension.
-  template <typename T>
-  struct SepticBlock {
-    T _0[7];
-  };
-
-  /// A set of columns needed to compute the global interaction elliptic curve digest.
-  /// Must match Rust GlobalInteractionOperation #[repr(C)].
-  template <typename T>
-  struct GlobalInteractionOperation {
-    // Hash-to-curve offset, a single byte (range-checked via a U8Range byte lookup).
-    T offset;
-    SepticBlock<T> x_coordinate;
-    SepticBlock<T> y_coordinate;
-    // Compact limb decomposition [lo16, mid, top] of the y_6 range-check value, validated by byte
-    // lookups (replaces the 30-bit decomposition + inverse witness). The Poseidon2 input (m_trial)
-    // and the full output are re-derived / bound via the lookup rather than committed.
-    T y6_limbs[3];
-  };
-
   /// Global Interaction Event.
   ///
   /// This event is emitted for all interactions that are sent or received across different chunks.
@@ -1178,39 +1151,27 @@ namespace pico_gpu {
     uint8_t kind;
   };
 
-  /// A set of columns needed to compute the global interaction elliptic curve digest.
-  /// Must match Rust GlobalAccumulationOperation #[repr(C)]: `lambda[i]` is the slope witness of
-  /// the chord from `cum[i]` to point i, `cum[i]` the running sum BEFORE point i is added (the
-  /// sum after the row is the next row's `cum[0]`; the last row is always padding).
-  /// It is critical that this struct is at the end of the main trace, as the permutation constraints
-  /// will be dependent on this fact. It is also critical that `cum` is at the end of this struct,
-  /// for the same reason.
-  template <typename T, uintptr_t N>
-  struct GlobalAccumulationOperation {
-    SepticBlock<T> lambda[N];
-    SepticBlock<T> cum[N][2];
-  };
-
+  /// The Global chip's row: one cross-chunk event. Must match Rust `GlobalCols` #[repr(C)]
+  /// (`vm/src/chips/chips/riscv_global/columns.rs`). The first ten columns are the chunk's event
+  /// table, which the prover commits on its own; padding rows are all zero.
   template <typename T>
   struct GlobalCols {
     T message[8];
     T kind;
+    /// The row's multiplicity in the global LogUp: +1 for a send, -1 for a receive.
+    T mu;
+    T is_real;
+    T is_send;
+    T is_receive;
     T message_0_16bit_limb;
     T message_0_8bit_limb;
-    /// The most significant (boolean) bit of message[0] (bit 24) — 25-bit widening, mirrors Rust.
+    /// The most significant (boolean) bit of message[0] (bit 24).
     T message_0_high_bit;
-    GlobalInteractionOperation<T> interaction;
-    T is_real;
-    T is_receive;
-    T is_send;
-    /// 16 + 9 limb decomposition of message[1]; mirrors Rust.
+    /// 16 + 9 limb decomposition of message[1].
     T message_1_16bit_limb;
     T message_1_hi9;
-    GlobalAccumulationOperation<T, 1> accumulation;
   };
-  // Column budget the riscv_global TPC kernels hardcode (35 fixed incl. the 2 message[1] limbs +
-  // 7 lambda + 14 cum). The field type is a 4-byte word, so the u32 instantiation has the same layout.
-  static_assert(sizeof(GlobalCols<uint32_t>) == 56 * sizeof(uint32_t), "GlobalCols must be 56 columns");
+  static_assert(sizeof(GlobalCols<uint32_t>) == 18 * sizeof(uint32_t), "GlobalCols must be 18 columns");
 
   template <typename T>
   struct BytePreprocessedCols {
@@ -1311,32 +1272,6 @@ namespace pico_gpu {
     PartialRound<T> partial_rounds[NumInternalRounds];
     FullRound<T> ending_full_rounds[NumHalfFullRounds];
   };
-
-  /// Last ending full round of the riscv Poseidon2 wrapper: only the lanes the Poseidon2 lookup
-  /// reads are committed. Must match Rust `RiscvLastFullRound` #[repr(C)] (KoalaBear: no S-box
-  /// registers).
-  template <typename T>
-  struct RiscvLastFullRound {
-    T post[RISCV_POSEIDON2_NUM_OUTPUTS];
-  };
-
-  /// riscv Poseidon2 wrapper slot: only the rate-8 inputs are committed (the capacity lanes are
-  /// AIR constants) and the last ending full round commits only the looked-up output lanes. Must
-  /// match Rust `RiscvPoseidon2ValueCols` #[repr(C)]; the recursion chips and the riscv Poseidon2
-  /// precompile keep the full-width `Poseidon2ValueCols`.
-  template <typename T, const int NumHalfFullRounds, const int NumInternalRounds>
-  struct RiscvPoseidon2ValueCols {
-    T is_real;
-    T input[RISCV_POSEIDON2_NUM_INPUTS];
-    FullRound<T> beginning_full_rounds[NumHalfFullRounds];
-    PartialRound<T> partial_rounds[NumInternalRounds];
-    FullRound<T> ending_full_rounds[NumHalfFullRounds - 1];
-    RiscvLastFullRound<T> last_full_round;
-  };
-  // KoalaBear (4 half full rounds, 20 partial rounds): 1 + 8 + 4*16 + 20 + 3*16 + 7 = 148.
-  static_assert(
-    sizeof(RiscvPoseidon2ValueCols<uint32_t, 4, 20>) == 148 * sizeof(uint32_t),
-    "RiscvPoseidon2ValueCols<KoalaBear> must be 148 columns");
 
   struct Poseidon2PermuteEvent {
     uint32_t chunk;
