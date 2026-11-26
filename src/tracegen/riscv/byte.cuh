@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <iostream>
+#include "common/exception.cuh"
 #include "common/rusterror.h"
 #include "tracegen/common/types.cuh"
 #include "tracegen/common/utils.cuh"
